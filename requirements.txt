@@ -5,3 +5,4 @@ gspread==6.1.4
 google-auth==2.38.0
 apscheduler==3.10.4
 pytz==2024.2
+python-dateutil==2.9.0
