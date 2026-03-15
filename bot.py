@@ -28,6 +28,16 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY")
 
+# Отладка
+logger.info(f"TELEGRAM_TOKEN exists: {TELEGRAM_TOKEN is not None}")
+logger.info(f"GIGACHAT_AUTH_KEY exists: {GIGACHAT_AUTH_KEY is not None}")
+if GIGACHAT_AUTH_KEY:
+    logger.info(f"GIGACHAT_AUTH_KEY length: {len(GIGACHAT_AUTH_KEY)}")
+    logger.info(f"GIGACHAT_AUTH_KEY starts with: {GIGACHAT_AUTH_KEY[:20]}...")
+else:
+    logger.error("GIGACHAT_AUTH_KEY is None or empty!")
+    logger.info(f"All environment variables: {list(os.environ.keys())}")
+
 # Инициализация бота
 bot = Bot(token=TELEGRAM_TOKEN)
 storage = MemoryStorage()
