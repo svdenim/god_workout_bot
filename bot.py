@@ -131,13 +131,14 @@ def init_db():
     
     # Таблица тренировок
     c.execute('''CREATE TABLE IF NOT EXISTS workouts
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  user_id INTEGER,
-                  workout_id TEXT,
-                  workout_number INTEGER,
-                  start_time TEXT,
-                  end_time TEXT,
-                  duration_minutes INTEGER)''')
+             (id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER,
+              workout_id TEXT,
+              workout_number INTEGER,
+              start_time TEXT,
+              end_time TEXT,
+              duration_minutes INTEGER,
+              synced_to_sheets INTEGER DEFAULT 0)''')
     
     # Таблица упражнений
     c.execute('''CREATE TABLE IF NOT EXISTS exercises
@@ -579,7 +580,7 @@ def get_or_create_user_sheet(client, spreadsheet, user_id: int):
     return worksheet
 
 async def sync_to_google_sheets():
-    """Синхронизация данных в Google Sheets"""
+    """Синхронизация данных в Google Sheets (только новые записи)"""
     try:
         client = get_google_sheets_client()
         if not client:
@@ -587,27 +588,25 @@ async def sync_to_google_sheets():
             return
         
         spreadsheet = client.open_by_key(GOOGLE_SPREADSHEET_ID)
-        today = datetime.now(TIMEZONE).date()
         
         conn = sqlite3.connect('workouts.db')
         c = conn.cursor()
         
-        # Получаем все завершённые тренировки за сегодня
-        c.execute('''SELECT DISTINCT w.user_id, w.workout_id, w.workout_number, 
+        # Получаем только НЕсинхронизированные завершённые тренировки
+        c.execute('''SELECT DISTINCT w.id, w.user_id, w.workout_id, w.workout_number, 
                             w.start_time, w.end_time, w.duration_minutes
                      FROM workouts w
-                     WHERE date(w.start_time) = ? AND w.end_time IS NOT NULL''', 
-                  (today.isoformat(),))
+                     WHERE w.end_time IS NOT NULL AND w.synced_to_sheets = 0''')
         
         workouts = c.fetchall()
         
         if not workouts:
-            logger.info("Нет данных для синхронизации")
+            logger.info("Нет новых данных для синхронизации")
             conn.close()
             return
         
         for workout in workouts:
-            user_id, workout_id, workout_number, start_time, end_time, duration = workout
+            w_id, user_id, workout_id, workout_number, start_time, end_time, duration = workout
             
             # Получаем профиль пользователя
             profile = get_user_profile(user_id)
@@ -659,13 +658,17 @@ async def sync_to_google_sheets():
                     cardio_time
                 ]
                 worksheet.append_row(row)
+            
+            # Помечаем тренировку как синхронизированную
+            c.execute('UPDATE workouts SET synced_to_sheets = 1 WHERE id = ?', (w_id,))
         
+        conn.commit()
         conn.close()
         logger.info(f"✅ Синхронизировано {len(workouts)} тренировок в Google Sheets")
         
     except Exception as e:
         logger.error(f"Ошибка синхронизации с Google Sheets: {e}")
-
+        
 # ============ КЛАВИАТУРЫ ============
 
 def get_main_menu():
