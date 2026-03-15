@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Токены
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID")
+GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY")
 
 # Инициализация бота
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -121,21 +121,17 @@ def parse_workout_input(text: str) -> Tuple[Optional[str], Optional[float], Opti
 
 # GigaChat API (обновлённая авторизация)
 async def get_gigachat_token():
-    """Получает access token для GigaChat через Client ID"""
-    if not GIGACHAT_CLIENT_ID:
-        logger.error("GIGACHAT_CLIENT_ID not set")
+    """Получает access token для GigaChat через Authorization key"""
+    if not GIGACHAT_AUTH_KEY:
+        logger.error("GIGACHAT_AUTH_KEY not set")
         return None
-    
-    # Создаём авторизационную строку
-    auth_string = f"{GIGACHAT_CLIENT_ID}:client_secret_placeholder"
-    auth_base64 = base64.b64encode(auth_string.encode()).decode()
     
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Accept': 'application/json',
         'RqUID': str(uuid.uuid4()),
-        'Authorization': f'Basic {auth_base64}'
+        'Authorization': f'Bearer {GIGACHAT_AUTH_KEY}'
     }
     data = {'scope': 'GIGACHAT_API_PERS'}
     
@@ -151,7 +147,7 @@ async def get_gigachat_token():
     except Exception as e:
         logger.error(f"GigaChat token error: {e}")
     return None
-
+    
 async def ask_gigachat(user_id: int, question: str):
     """Отправляет запрос в GigaChat с историей пользователя"""
     try:
