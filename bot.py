@@ -29,6 +29,30 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID")
 GIGACHAT_CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET")
 
+# Отладка переменных
+print("=== DEBUG: Checking environment variables ===")
+print(f"TELEGRAM_TOKEN exists: {TELEGRAM_TOKEN is not None}")
+print(f"GIGACHAT_CLIENT_ID exists: {GIGACHAT_CLIENT_ID is not None}")
+print(f"GIGACHAT_CLIENT_SECRET exists: {GIGACHAT_CLIENT_SECRET is not None}")
+
+if GIGACHAT_CLIENT_ID:
+    print(f"GIGACHAT_CLIENT_ID starts with: {GIGACHAT_CLIENT_ID[:8]}...")
+else:
+    print("GIGACHAT_CLIENT_ID is EMPTY!")
+    
+if GIGACHAT_CLIENT_SECRET:
+    print(f"GIGACHAT_CLIENT_SECRET starts with: {GIGACHAT_CLIENT_SECRET[:8]}...")
+else:
+    print("GIGACHAT_CLIENT_SECRET is EMPTY!")
+
+# Показать все переменные с GIGA в названии
+print("=== All GIGA* variables ===")
+for key in os.environ.keys():
+    if "GIGA" in key.upper():
+        print(f"  {key} = {os.environ[key][:20]}...")
+
+print("=== END DEBUG ===")
+
 # Инициализация бота
 bot = Bot(token=TELEGRAM_TOKEN)
 storage = MemoryStorage()
