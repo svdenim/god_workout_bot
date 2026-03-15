@@ -26,17 +26,8 @@ logger = logging.getLogger(__name__)
 
 # Токены
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_KEY")
-
-# Отладка
-logger.info(f"TELEGRAM_TOKEN exists: {TELEGRAM_TOKEN is not None}")
-logger.info(f"GIGACHAT_AUTH_KEY exists: {GIGACHAT_AUTH_KEY is not None}")
-if GIGACHAT_AUTH_KEY:
-    logger.info(f"GIGACHAT_AUTH_KEY length: {len(GIGACHAT_AUTH_KEY)}")
-    logger.info(f"GIGACHAT_AUTH_KEY starts with: {GIGACHAT_AUTH_KEY[:20]}...")
-else:
-    logger.error("GIGACHAT_AUTH_KEY is None or empty!")
-    logger.info(f"All environment variables: {list(os.environ.keys())}")
+GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID")
+GIGACHAT_CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET")
 
 # Инициализация бота
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -131,17 +122,21 @@ def parse_workout_input(text: str) -> Tuple[Optional[str], Optional[float], Opti
 
 # GigaChat API (обновлённая авторизация)
 async def get_gigachat_token():
-    """Получает access token для GigaChat через Authorization key"""
-    if not GIGACHAT_AUTH_KEY:
-        logger.error("GIGACHAT_AUTH_KEY not set")
+    """Получает access token для GigaChat через Client ID и Secret"""
+    if not GIGACHAT_CLIENT_ID or not GIGACHAT_CLIENT_SECRET:
+        logger.error("GIGACHAT_CLIENT_ID or GIGACHAT_CLIENT_SECRET not set")
         return None
+    
+    # Кодируем Client ID:Client Secret в Base64
+    credentials = f"{GIGACHAT_CLIENT_ID}:{GIGACHAT_CLIENT_SECRET}"
+    auth_key = base64.b64encode(credentials.encode()).decode()
     
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Accept': 'application/json',
         'RqUID': str(uuid.uuid4()),
-        'Authorization': f'Basic {GIGACHAT_AUTH_KEY}'  # ← ИЗМЕНЕНО: Basic вместо Bearer
+        'Authorization': f'Basic {auth_key}'
     }
     data = {'scope': 'GIGACHAT_API_PERS'}
     
@@ -150,13 +145,13 @@ async def get_gigachat_token():
             async with session.post(url, headers=headers, data=data, ssl=False) as response:
                 if response.status == 200:
                     result = await response.json()
-                    logger.info("GigaChat token получен успешно")
+                    logger.info("✅ GigaChat token получен успешно")
                     return result.get('access_token')
                 else:
                     error_text = await response.text()
-                    logger.error(f"GigaChat auth error {response.status}: {error_text}")
+                    logger.error(f"❌ GigaChat auth error {response.status}: {error_text}")
     except Exception as e:
-        logger.error(f"GigaChat token error: {e}")
+        logger.error(f"❌ GigaChat token error: {e}")
     return None
     
 async def ask_gigachat(user_id: int, question: str):
