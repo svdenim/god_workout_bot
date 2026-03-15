@@ -6,8 +6,9 @@ import sqlite3
 import base64
 import uuid
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional, Tuple
+from dateutil.relativedelta import relativedelta
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -21,6 +22,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 import pytz
 
 # Загрузка переменных окружения
@@ -34,37 +36,118 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID")
 GIGACHAT_CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET")
-ADMIN_ID = 295220429  # Твой ID
+ADMIN_ID = 295220429
 GOOGLE_SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
 GOOGLE_SHEETS_CREDENTIALS = os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+
+# Часовой пояс
+TIMEZONE = pytz.timezone('Europe/Moscow')
 
 # Инициализация бота
 bot = Bot(token=TELEGRAM_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-scheduler = AsyncIOScheduler(timezone=pytz.timezone('Europe/Moscow'))
+scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+
+# Словарь для отслеживания напоминаний о завершении тренировки
+workout_reminders = {}
 
 # FSM состояния
 class WorkoutStates(StatesGroup):
-    in_workout = State()
     entering_sets = State()
 
-# Инициализация БД
+class ProfileStates(StatesGroup):
+    entering_name = State()
+    entering_gender = State()
+    entering_birthdate = State()
+    entering_weight = State()
+    updating_weight = State()
+
+# Группы мышц
+MUSCLE_GROUPS = {
+    # Грудь
+    'жим лежа': 'Грудь', 'жим гантелей': 'Грудь', 'разводка': 'Грудь', 
+    'отжимания': 'Грудь', 'жим на наклонной': 'Грудь', 'кроссовер': 'Грудь',
+    'бабочка': 'Грудь', 'пуловер': 'Грудь',
+    
+    # Спина
+    'становая тяга': 'Спина', 'тяга штанги': 'Спина', 'тяга гантели': 'Спина',
+    'подтягивания': 'Спина', 'тяга верхнего блока': 'Спина', 'тяга горизонтального блока': 'Спина',
+    'тяга нижнего блока': 'Спина', 'гиперэкстензия': 'Спина', 'тяга т-грифа': 'Спина',
+    
+    # Плечи
+    'жим стоя': 'Плечи', 'жим сидя': 'Плечи', 'махи гантелей': 'Плечи',
+    'махи в стороны': 'Плечи', 'махи вперед': 'Плечи', 'тяга к подбородку': 'Плечи',
+    'разведение гантелей': 'Плечи', 'армейский жим': 'Плечи',
+    
+    # Бицепс
+    'сгибания на бицепс': 'Бицепс', 'подъем на бицепс': 'Бицепс', 'молотки': 'Бицепс',
+    'бицепс штанга': 'Бицепс', 'бицепс гантели': 'Бицепс', 'концентрированные сгибания': 'Бицепс',
+    
+    # Трицепс
+    'французский жим': 'Трицепс', 'брусья': 'Трицепс', 'разгибания на трицепс': 'Трицепс',
+    'отжимания на брусьях': 'Трицепс', 'разгибания рук': 'Трицепс', 'трицепс блок': 'Трицепс',
+    
+    # Ноги
+    'приседания': 'Ноги', 'присед': 'Ноги', 'выпады': 'Ноги', 'жим ногами': 'Ноги',
+    'разгибания ног': 'Ноги', 'сгибания ног': 'Ноги', 'икры': 'Ноги',
+    'подъем на носки': 'Ноги', 'румынская тяга': 'Ноги', 'мертвая тяга': 'Ноги',
+    
+    # Пресс
+    'пресс': 'Пресс', 'скручивания': 'Пресс', 'планка': 'Пресс', 'подъем ног': 'Пресс',
+    'велосипед пресс': 'Пресс', 'косые мышцы': 'Пресс', 'вакуум': 'Пресс',
+    
+    # Кардио
+    'бег': 'Кардио', 'велосипед': 'Кардио', 'эллипс': 'Кардио', 'ходьба': 'Кардио',
+    'скакалка': 'Кардио', 'гребля': 'Кардио', 'степпер': 'Кардио', 'плавание': 'Кардио',
+}
+
+WEEKDAYS_RU = {
+    0: 'Понедельник', 1: 'Вторник', 2: 'Среда', 3: 'Четверг',
+    4: 'Пятница', 5: 'Суббота', 6: 'Воскресенье'
+}
+
+# ============ ИНИЦИАЛИЗАЦИЯ БД ============
+
 def init_db():
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
+    
+    # Таблица пользователей (профили)
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER UNIQUE,
+                  name TEXT,
+                  gender TEXT,
+                  birthdate TEXT,
+                  created_at TEXT)''')
+    
+    # Таблица весов пользователя
+    c.execute('''CREATE TABLE IF NOT EXISTS user_weights
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER,
+                  weight_kg REAL,
+                  recorded_at TEXT)''')
+    
+    # Таблица тренировок
     c.execute('''CREATE TABLE IF NOT EXISTS workouts
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   user_id INTEGER,
                   workout_id TEXT,
+                  workout_number INTEGER,
                   start_time TEXT,
                   end_time TEXT,
                   duration_minutes INTEGER)''')
+    
+    # Таблица упражнений
     c.execute('''CREATE TABLE IF NOT EXISTS exercises
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   workout_id TEXT,
                   exercise_name TEXT,
+                  muscle_group TEXT,
                   timestamp TEXT)''')
+    
+    # Таблица подходов
     c.execute('''CREATE TABLE IF NOT EXISTS sets
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   exercise_id INTEGER,
@@ -73,29 +156,136 @@ def init_db():
                   duration_seconds INTEGER,
                   set_type TEXT,
                   timestamp TEXT)''')
+    
     conn.commit()
     conn.close()
 
 init_db()
 
-# ============ ПРОВЕРКА НЕЗАВЕРШЁННЫХ ТРЕНИРОВОК ============
+# ============ ФУНКЦИИ ДЛЯ ПРОФИЛЯ ============
 
-def get_unfinished_workout(user_id: int) -> Optional[dict]:
-    """Проверяет есть ли незавершённая тренировка (end_time IS NULL)"""
+def get_user_profile(user_id: int) -> Optional[dict]:
+    """Получает профиль пользователя"""
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
-    
-    c.execute('''SELECT workout_id, start_time 
-                 FROM workouts 
-                 WHERE user_id = ? AND end_time IS NULL
-                 ORDER BY start_time DESC 
-                 LIMIT 1''', (user_id,))
-    
+    c.execute('SELECT name, gender, birthdate, created_at FROM users WHERE user_id = ?', (user_id,))
     result = c.fetchone()
     conn.close()
     
     if result:
-        return {'workout_id': result[0], 'start_time': result[1]}
+        return {
+            'name': result[0],
+            'gender': result[1],
+            'birthdate': result[2],
+            'created_at': result[3]
+        }
+    return None
+
+def create_user_profile(user_id: int, name: str, gender: str, birthdate: str):
+    """Создаёт профиль пользователя"""
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('''INSERT OR REPLACE INTO users (user_id, name, gender, birthdate, created_at)
+                 VALUES (?, ?, ?, ?, ?)''',
+              (user_id, name, gender, birthdate, datetime.now(TIMEZONE).isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_user_current_weight(user_id: int) -> Optional[float]:
+    """Получает последний вес пользователя"""
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('''SELECT weight_kg FROM user_weights 
+                 WHERE user_id = ? ORDER BY recorded_at DESC LIMIT 1''', (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+def get_user_first_weight(user_id: int) -> Optional[float]:
+    """Получает первый (начальный) вес пользователя"""
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('''SELECT weight_kg FROM user_weights 
+                 WHERE user_id = ? ORDER BY recorded_at ASC LIMIT 1''', (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+def get_user_previous_weight(user_id: int) -> Optional[float]:
+    """Получает предыдущий вес (до последнего)"""
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('''SELECT weight_kg FROM user_weights 
+                 WHERE user_id = ? ORDER BY recorded_at DESC LIMIT 2''', (user_id,))
+    results = c.fetchall()
+    conn.close()
+    return results[1][0] if len(results) > 1 else None
+
+def add_user_weight(user_id: int, weight: float):
+    """Добавляет запись веса пользователя"""
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('''INSERT INTO user_weights (user_id, weight_kg, recorded_at)
+                 VALUES (?, ?, ?)''',
+              (user_id, weight, datetime.now(TIMEZONE).isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_last_weight_date(user_id: int) -> Optional[datetime]:
+    """Получает дату последнего взвешивания"""
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('''SELECT recorded_at FROM user_weights 
+                 WHERE user_id = ? ORDER BY recorded_at DESC LIMIT 1''', (user_id,))
+    result = c.fetchone()
+    conn.close()
+    if result:
+        return datetime.fromisoformat(result[0])
+    return None
+
+def needs_weight_update(user_id: int) -> bool:
+    """Проверяет, нужно ли обновить вес (прошло больше 30 дней)"""
+    last_date = get_last_weight_date(user_id)
+    if not last_date:
+        return True
+    
+    now = datetime.now(TIMEZONE)
+    if last_date.tzinfo is None:
+        last_date = TIMEZONE.localize(last_date)
+    
+    return (now - last_date).days >= 30
+
+def calculate_age(birthdate_str: str) -> int:
+    """Вычисляет возраст по дате рождения"""
+    birthdate = datetime.strptime(birthdate_str, '%d.%m.%Y').date()
+    today = date.today()
+    age = today.year - birthdate.year - ((today.month, today.day) < (birthdate.month, birthdate.day))
+    return age
+
+# ============ ФУНКЦИИ ДЛЯ ТРЕНИРОВОК ============
+
+def get_next_workout_number(user_id: int) -> int:
+    """Получает номер следующей тренировки"""
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('SELECT MAX(workout_number) FROM workouts WHERE user_id = ?', (user_id,))
+    result = c.fetchone()
+    conn.close()
+    return (result[0] or 0) + 1
+
+def get_unfinished_workout(user_id: int) -> Optional[dict]:
+    """Проверяет есть ли незавершённая тренировка"""
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('''SELECT workout_id, start_time, workout_number 
+                 FROM workouts 
+                 WHERE user_id = ? AND end_time IS NULL
+                 ORDER BY start_time DESC LIMIT 1''', (user_id,))
+    result = c.fetchone()
+    conn.close()
+    
+    if result:
+        return {'workout_id': result[0], 'start_time': result[1], 'workout_number': result[2]}
     return None
 
 def get_workout_exercises_count(workout_id: str) -> int:
@@ -108,11 +298,10 @@ def get_workout_exercises_count(workout_id: str) -> int:
     return count
 
 def finish_workout_in_db(workout_id: str, user_id: int) -> dict:
-    """Завершает тренировку в БД и возвращает статистику"""
+    """Завершает тренировку в БД"""
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
     
-    # Получаем время начала
     c.execute('SELECT start_time FROM workouts WHERE workout_id = ?', (workout_id,))
     result = c.fetchone()
     
@@ -121,16 +310,16 @@ def finish_workout_in_db(workout_id: str, user_id: int) -> dict:
         return {'error': 'Тренировка не найдена'}
     
     start_time = datetime.fromisoformat(result[0])
-    end_time = datetime.now()
+    end_time = datetime.now(TIMEZONE)
+    
+    if start_time.tzinfo is None:
+        start_time = TIMEZONE.localize(start_time)
+    
     duration = int((end_time - start_time).total_seconds() / 60)
     
-    # Обновляем тренировку
-    c.execute('''UPDATE workouts 
-                 SET end_time = ?, duration_minutes = ?
-                 WHERE workout_id = ?''',
+    c.execute('''UPDATE workouts SET end_time = ?, duration_minutes = ? WHERE workout_id = ?''',
               (end_time.isoformat(), duration, workout_id))
     
-    # Получаем статистику
     c.execute('''SELECT COUNT(DISTINCT e.id), COUNT(s.id), 
                         SUM(CASE WHEN s.set_type = 'strength' THEN s.weight_kg * s.reps ELSE 0 END)
                  FROM exercises e
@@ -149,116 +338,121 @@ def finish_workout_in_db(workout_id: str, user_id: int) -> dict:
     }
 
 def cancel_workout_in_db(workout_id: str) -> bool:
-    """Отменяет (удаляет) незавершённую тренировку"""
+    """Отменяет тренировку"""
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
-    
-    # Удаляем подходы
-    c.execute('''DELETE FROM sets WHERE exercise_id IN 
-                 (SELECT id FROM exercises WHERE workout_id = ?)''', (workout_id,))
-    
-    # Удаляем упражнения
+    c.execute('DELETE FROM sets WHERE exercise_id IN (SELECT id FROM exercises WHERE workout_id = ?)', (workout_id,))
     c.execute('DELETE FROM exercises WHERE workout_id = ?', (workout_id,))
-    
-    # Удаляем тренировку
     c.execute('DELETE FROM workouts WHERE workout_id = ?', (workout_id,))
-    
     conn.commit()
     conn.close()
     return True
 
-# ============ GOOGLE SHEETS ============
+# ============ ОПРЕДЕЛЕНИЕ ГРУППЫ МЫШЦ ============
 
-def get_google_sheets_client():
+async def get_muscle_group(exercise_name: str) -> str:
+    """Определяет группу мышц по названию упражнения"""
+    exercise_lower = exercise_name.lower()
+    
+    # Сначала ищем в локальном словаре
+    for key, group in MUSCLE_GROUPS.items():
+        if key in exercise_lower:
+            return group
+    
+    # Если не нашли — спрашиваем GigaChat
     try:
-        creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS)
-        scopes = ['https://www.googleapis.com/auth/spreadsheets']
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        return client
+        token = await get_gigachat_token()
+        if token:
+            url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+            headers = {
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {token}'
+            }
+            payload = {
+                "model": "GigaChat",
+                "messages": [
+                    {"role": "system", "content": "Ответь одним словом — название группы мышц. Варианты: Грудь, Спина, Плечи, Бицепс, Трицепс, Ноги, Пресс, Кардио, Другое"},
+                    {"role": "user", "content": f"Какая группа мышц: {exercise_name}"}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 20
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload, ssl=False) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result['choices'][0]['message']['content'].strip()
     except Exception as e:
-        logger.error(f"Google Sheets auth error: {e}")
-        return None
+        logger.error(f"Error getting muscle group: {e}")
+    
+    return "Другое"
 
-async def sync_to_google_sheets():
-    """Синхронизация данных в Google Sheets (вызывается в 23:59)"""
-    try:
-        client = get_google_sheets_client()
-        if not client:
-            logger.error("Не удалось подключиться к Google Sheets")
-            return
-        
-        sheet = client.open_by_key(GOOGLE_SPREADSHEET_ID)
-        
-        # Получаем данные за сегодня
-        today = datetime.now().date()
-        conn = sqlite3.connect('workouts.db')
-        c = conn.cursor()
-        
-        c.execute('''SELECT w.user_id, w.start_time, w.end_time, w.duration_minutes,
-                            e.exercise_name, s.weight_kg, s.reps, s.duration_seconds, s.set_type
-                     FROM workouts w
-                     JOIN exercises e ON w.workout_id = e.workout_id
-                     JOIN sets s ON e.id = s.exercise_id
-                     WHERE date(w.start_time) = ? AND w.end_time IS NOT NULL''', (today.isoformat(),))
-        
-        rows = c.fetchall()
-        conn.close()
-        
-        if not rows:
-            logger.info("Нет данных для синхронизации")
-            return
-        
-        # Worksheet "Data"
-        try:
-            worksheet = sheet.worksheet("Data")
-        except:
-            worksheet = sheet.add_worksheet(title="Data", rows=1000, cols=10)
-            worksheet.append_row(["User ID", "Дата", "Время начала", "Время конца", 
-                                  "Длительность (мин)", "Упражнение", "Вес (кг)", 
-                                  "Повторы", "Длительность (сек)", "Тип"])
-        
-        # Добавляем строки
-        for row in rows:
-            worksheet.append_row(list(row))
-        
-        logger.info(f"✅ Синхронизировано {len(rows)} записей в Google Sheets")
-        
-    except Exception as e:
-        logger.error(f"Ошибка синхронизации с Google Sheets: {e}")
+# ============ ПАРСЕР УПРАЖНЕНИЙ (ОБНОВЛЁННЫЙ) ============
 
-# ============ ПАРСЕР УПРАЖНЕНИЙ ============
-
-def parse_workout_input(text: str) -> Tuple[Optional[str], Optional[float], Optional[int], Optional[int], str]:
+def parse_workout_input(text: str, user_weight: float = 0) -> Tuple[Optional[str], Optional[float], Optional[int], Optional[int], str]:
+    """Парсит ввод упражнения с учётом собственного веса"""
     text = text.strip()
     
     # Паттерн 1: Упражнение + вес-повторы (Жим лежа 80-10)
     pattern1 = r'^(.+?)\s+(\d+(?:\.\d+)?)\s*[-xх×*]\s*(\d+)$'
     match = re.match(pattern1, text, re.IGNORECASE)
     if match:
-        return (match.group(1).strip(), float(match.group(2)), int(match.group(3)), None, 'strength')
+        exercise = match.group(1).strip()
+        weight = float(match.group(2))
+        reps = int(match.group(3))
+        return (exercise, weight, reps, None, 'strength')
     
-    # Паттерн 2: Только вес-повторы (80-10)
+    # Паттерн 2: Только вес-повторы (80-10) — для продолжения упражнения
     pattern2 = r'^(\d+(?:\.\d+)?)\s*[-xх×*]\s*(\d+)$'
     match = re.match(pattern2, text)
     if match:
-        return (None, float(match.group(1)), int(match.group(2)), None, 'strength')
+        weight = float(match.group(1))
+        reps = int(match.group(2))
+        return (None, weight, reps, None, 'strength')
     
-    # Паттерн 3: Упражнение + минуты (Бег 5 минут)
-    pattern3 = r'^(.+?)\s+(\d+)\s*(мин|минут|минуты|min|м).*$'
+    # Паттерн 3: Упражнение "с весом" + доп.вес-повторы (Подтягивания с весом 15-12)
+    pattern3 = r'^(.+?)\s+с\s+весом\s+(\d+(?:\.\d+)?)\s*[-xх×*]\s*(\d+)$'
     match = re.match(pattern3, text, re.IGNORECASE)
     if match:
-        return (match.group(1).strip(), None, None, int(match.group(2)) * 60, 'cardio')
+        exercise = match.group(1).strip()
+        extra_weight = float(match.group(2))
+        reps = int(match.group(3))
+        total_weight = user_weight + extra_weight
+        return (exercise, total_weight, reps, None, 'strength')
     
-    # Паттерн 4: Упражнение + секунды (Планка 60 секунд)
-    pattern4 = r'^(.+?)\s+(\d+)\s*(сек|секунд|секунды|sec|с).*$'
+    # Паттерн 4: Упражнение + только повторы (Подтягивания 12) — свой вес
+    pattern4 = r'^(.+?)\s+(\d+)$'
     match = re.match(pattern4, text, re.IGNORECASE)
     if match:
-        return (match.group(1).strip(), None, None, int(match.group(2)), 'static')
+        exercise = match.group(1).strip()
+        reps = int(match.group(2))
+        # Проверяем что это не минуты/секунды
+        if not any(word in exercise.lower() for word in ['мин', 'сек', 'час']):
+            return (exercise, user_weight, reps, None, 'strength')
     
-    # Паттерн 5: Только название упражнения
-    if not any(char.isdigit() for char in text):
-        return (text, None, None, None, 'unknown')
+    # Паттерн 5: Упражнение + минуты (Бег 5 минут / Бег 5 мин / Бег 5м)
+    pattern5 = r'^(.+?)\s+(\d+)\s*(мин|минут|минуты|min|м)\s*$'
+    match = re.match(pattern5, text, re.IGNORECASE)
+    if match:
+        exercise = match.group(1).strip()
+        minutes = int(match.group(2))
+        return (exercise, None, None, minutes * 60, 'cardio')
+    
+    # Паттерн 6: Упражнение + часы (Велосипед 1 час)
+    pattern6 = r'^(.+?)\s+(\d+)\s*(час|часа|часов|ч|hour|h)\s*$'
+    match = re.match(pattern6, text, re.IGNORECASE)
+    if match:
+        exercise = match.group(1).strip()
+        hours = int(match.group(2))
+        return (exercise, None, None, hours * 3600, 'cardio')
+    
+    # Паттерн 7: Упражнение + секунды (Планка 60 секунд)
+    pattern7 = r'^(.+?)\s+(\d+)\s*(сек|секунд|секунды|sec|с)\s*$'
+    match = re.match(pattern7, text, re.IGNORECASE)
+    if match:
+        exercise = match.group(1).strip()
+        seconds = int(match.group(2))
+        return (exercise, None, None, seconds, 'static')
     
     return (None, None, None, None, 'unknown')
 
@@ -291,28 +485,24 @@ async def get_gigachat_token():
     return None
 
 async def ask_gigachat(user_id: int, question: str):
+    """Отправляет вопрос в GigaChat с КРАТКИМИ ответами"""
     try:
         conn = sqlite3.connect('workouts.db')
         c = conn.cursor()
-        
         c.execute('''SELECT w.start_time, e.exercise_name, s.weight_kg, s.reps, s.duration_seconds, s.set_type
                      FROM workouts w
                      JOIN exercises e ON w.workout_id = e.workout_id
                      JOIN sets s ON e.id = s.exercise_id
                      WHERE w.user_id = ?
-                     ORDER BY w.start_time DESC
-                     LIMIT 100''', (user_id,))
-        
+                     ORDER BY w.start_time DESC LIMIT 50''', (user_id,))
         history = c.fetchall()
         conn.close()
         
-        context = "История тренировок:\n"
-        for row in history[:20]:
+        context = "История тренировок (последние):\n"
+        for row in history[:10]:
             date, exercise, weight, reps, duration, set_type = row
             if set_type == 'strength':
-                context += f"{date}: {exercise} - {weight}кг x {reps} раз\n"
-            elif set_type in ['cardio', 'static']:
-                context += f"{date}: {exercise} - {duration} секунд\n"
+                context += f"- {exercise}: {weight}кг x {reps}\n"
         
         token = await get_gigachat_token()
         if not token:
@@ -321,18 +511,28 @@ async def ask_gigachat(user_id: int, question: str):
         url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
         headers = {
             'Content-Type': 'application/json',
-            'Accept': 'application/json',
             'Authorization': f'Bearer {token}'
         }
+        
+        # ОБНОВЛЁННЫЙ ПРОМПТ для кратких ответов
+        system_prompt = f"""Ты — персональный фитнес-тренер. 
+
+ПРАВИЛА ОТВЕТА:
+1. Отвечай КРАТКО — максимум 500 символов
+2. Используй структуру: эмодзи + тезисы + короткий вывод
+3. Без длинных вступлений и "воды"
+4. Только суть и практические советы
+
+{context}"""
         
         payload = {
             "model": "GigaChat",
             "messages": [
-                {"role": "system", "content": f"Ты персональный тренер. {context}"},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": question}
             ],
             "temperature": 0.7,
-            "max_tokens": 1024
+            "max_tokens": 500
         }
         
         async with aiohttp.ClientSession() as session:
@@ -341,10 +541,130 @@ async def ask_gigachat(user_id: int, question: str):
                     result = await response.json()
                     return result['choices'][0]['message']['content']
                 return "Ошибка GigaChat API"
-                    
+                
     except Exception as e:
         logger.error(f"GigaChat error: {e}")
         return "Ошибка при обращении к ИИ"
+# ============ GOOGLE SHEETS ============
+
+def get_google_sheets_client():
+    try:
+        if not GOOGLE_SHEETS_CREDENTIALS:
+            return None
+        creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS)
+        scopes = ['https://www.googleapis.com/auth/spreadsheets']
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        return client
+    except Exception as e:
+        logger.error(f"Google Sheets auth error: {e}")
+        return None
+
+def get_or_create_user_sheet(client, spreadsheet, user_id: int):
+    """Получает или создаёт лист для пользователя"""
+    sheet_name = str(user_id)
+    try:
+        worksheet = spreadsheet.worksheet(sheet_name)
+    except:
+        # Создаём новый лист
+        worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=20)
+        # Добавляем заголовки
+        headers = [
+            "User ID", "Имя", "Дата рождения", "Вес user", "ID тренировки",
+            "Дата и время начала", "Дата и время окончания", "День недели",
+            "Длительность, мин", "Упражнение", "Группа мышц", "Вес (кг)",
+            "Повторы", "Время кардио, мин"
+        ]
+        worksheet.append_row(headers)
+    return worksheet
+
+async def sync_to_google_sheets():
+    """Синхронизация данных в Google Sheets"""
+    try:
+        client = get_google_sheets_client()
+        if not client:
+            logger.error("Не удалось подключиться к Google Sheets")
+            return
+        
+        spreadsheet = client.open_by_key(GOOGLE_SPREADSHEET_ID)
+        today = datetime.now(TIMEZONE).date()
+        
+        conn = sqlite3.connect('workouts.db')
+        c = conn.cursor()
+        
+        # Получаем все завершённые тренировки за сегодня
+        c.execute('''SELECT DISTINCT w.user_id, w.workout_id, w.workout_number, 
+                            w.start_time, w.end_time, w.duration_minutes
+                     FROM workouts w
+                     WHERE date(w.start_time) = ? AND w.end_time IS NOT NULL''', 
+                  (today.isoformat(),))
+        
+        workouts = c.fetchall()
+        
+        if not workouts:
+            logger.info("Нет данных для синхронизации")
+            conn.close()
+            return
+        
+        for workout in workouts:
+            user_id, workout_id, workout_number, start_time, end_time, duration = workout
+            
+            # Получаем профиль пользователя
+            profile = get_user_profile(user_id)
+            user_weight = get_user_current_weight(user_id) or 0
+            
+            name = profile['name'] if profile else 'Unknown'
+            birthdate = profile['birthdate'] if profile else ''
+            
+            # Форматируем даты
+            start_dt = datetime.fromisoformat(start_time)
+            end_dt = datetime.fromisoformat(end_time) if end_time else None
+            
+            start_formatted = start_dt.strftime('%Y-%m-%dT%H:%M')
+            end_formatted = end_dt.strftime('%Y-%m-%dT%H:%M') if end_dt else ''
+            weekday = WEEKDAYS_RU[start_dt.weekday()]
+            
+            # Получаем лист пользователя
+            worksheet = get_or_create_user_sheet(client, spreadsheet, user_id)
+            
+            # Получаем упражнения и подходы
+            c.execute('''SELECT e.exercise_name, e.muscle_group, s.weight_kg, s.reps, 
+                               s.duration_seconds, s.set_type
+                         FROM exercises e
+                         JOIN sets s ON e.id = s.exercise_id
+                         WHERE e.workout_id = ?
+                         ORDER BY e.id, s.id''', (workout_id,))
+            
+            sets_data = c.fetchall()
+            
+            for exercise_name, muscle_group, weight, reps, duration_sec, set_type in sets_data:
+                cardio_time = ''
+                if set_type == 'cardio' and duration_sec:
+                    cardio_time = duration_sec // 60
+                
+                row = [
+                    user_id,
+                    name,
+                    birthdate,
+                    user_weight,
+                    f"Тренировка {workout_number}",
+                    start_formatted,
+                    end_formatted,
+                    weekday,
+                    duration or 0,
+                    exercise_name,
+                    muscle_group or '',
+                    weight if set_type == 'strength' else '',
+                    reps if set_type == 'strength' else '',
+                    cardio_time
+                ]
+                worksheet.append_row(row)
+        
+        conn.close()
+        logger.info(f"✅ Синхронизировано {len(workouts)} тренировок в Google Sheets")
+        
+    except Exception as e:
+        logger.error(f"Ошибка синхронизации с Google Sheets: {e}")
 
 # ============ КЛАВИАТУРЫ ============
 
@@ -353,7 +673,8 @@ def get_main_menu():
         [InlineKeyboardButton(text="🏋️ Начать тренировку", callback_data="start_workout")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
          InlineKeyboardButton(text="📅 История", callback_data="history")],
-        [InlineKeyboardButton(text="❓ Помощь", callback_data="help")]
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
+         InlineKeyboardButton(text="❓ Помощь", callback_data="help")]
     ])
 
 def get_workout_menu():
@@ -363,46 +684,329 @@ def get_workout_menu():
     ])
 
 def get_unfinished_workout_menu(workout_id: str):
-    """Меню для незавершённой тренировки"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Продолжить", callback_data=f"continue_workout:{workout_id}")],
         [InlineKeyboardButton(text="🏁 Завершить", callback_data=f"finish_old_workout:{workout_id}")],
         [InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_workout:{workout_id}")]
     ])
 
-# ============ ХЭНДЛЕРЫ ============
+def get_gender_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👨 Мужской", callback_data="gender_m"),
+         InlineKeyboardButton(text="👩 Женский", callback_data="gender_f")]
+    ])
+
+def get_reminder_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏁 Завершить", callback_data="end_workout")],
+        [InlineKeyboardButton(text="💪 Ещё тренируюсь", callback_data="continue_training")]
+    ])
+
+# ============ НАПОМИНАНИЕ О ЗАВЕРШЕНИИ ТРЕНИРОВКИ ============
+
+async def send_workout_reminder(user_id: int, workout_id: str):
+    """Отправляет напоминание о завершении тренировки через 2 часа"""
+    try:
+        await bot.send_message(
+            user_id,
+            "⏰ Твоя тренировка идёт уже 2 часа!\n\n"
+            "Завершить её?",
+            reply_markup=get_reminder_keyboard()
+        )
+        
+        # Планируем автозавершение через 15 минут
+        run_time = datetime.now(TIMEZONE) + timedelta(minutes=15)
+        scheduler.add_job(
+            auto_finish_workout,
+            DateTrigger(run_date=run_time),
+            args=[user_id, workout_id],
+            id=f"auto_finish_{workout_id}",
+            replace_existing=True
+        )
+        
+        workout_reminders[workout_id] = True
+        
+    except Exception as e:
+        logger.error(f"Error sending reminder: {e}")
+
+async def auto_finish_workout(user_id: int, workout_id: str):
+    """Автоматически завершает тренировку"""
+    try:
+        # Проверяем, не была ли тренировка уже завершена
+        unfinished = get_unfinished_workout(user_id)
+        if not unfinished or unfinished['workout_id'] != workout_id:
+            return
+        
+        stats = finish_workout_in_db(workout_id, user_id)
+        
+        if 'error' not in stats:
+            tonnage_str = f"{stats['tonnage']:.0f}" if stats['tonnage'] else "0"
+            await bot.send_message(
+                user_id,
+                f"🏁 Тренировка автоматически завершена!\n\n"
+                f"⏱ Длительность: {stats['duration']} минут\n"
+                f"📊 Выполнено: {stats['exercises_count']} упражнений, {stats['sets_count']} подходов\n"
+                f"💪 Общий тоннаж: {tonnage_str} кг",
+                reply_markup=get_main_menu()
+            )
+        
+        # Удаляем из отслеживания
+        if workout_id in workout_reminders:
+            del workout_reminders[workout_id]
+            
+    except Exception as e:
+        logger.error(f"Error auto-finishing workout: {e}")
+
+def schedule_workout_reminder(user_id: int, workout_id: str):
+    """Планирует напоминание через 2 часа"""
+    run_time = datetime.now(TIMEZONE) + timedelta(hours=2)
+    scheduler.add_job(
+        send_workout_reminder,
+        DateTrigger(run_date=run_time),
+        args=[user_id, workout_id],
+        id=f"reminder_{workout_id}",
+        replace_existing=True
+    )
+
+def cancel_workout_reminders(workout_id: str):
+    """Отменяет все напоминания для тренировки"""
+    try:
+        scheduler.remove_job(f"reminder_{workout_id}")
+    except:
+        pass
+    try:
+        scheduler.remove_job(f"auto_finish_{workout_id}")
+    except:
+        pass
+    if workout_id in workout_reminders:
+        del workout_reminders[workout_id]
+
+# ============ ОБРАБОТЧИКИ ПРОФИЛЯ ============
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "💪 Привет! Я твой персональный тренер.\n\n"
-        "🏋️ Как записывать тренировки:\n"
-        "• Жим лежа 80-10 (упражнение вес-повторы)\n"
-        "• Бег 5 минут\n"
-        "• Планка 60 секунд\n\n"
-        "Выбери действие:",
-        reply_markup=get_main_menu()
-    )
+async def cmd_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    profile = get_user_profile(user_id)
+    
+    if not profile:
+        # Нет профиля — просим заполнить
+        await message.answer(
+            "👋 Привет! Для начала тренировок тебе необходимо заполнить свой профиль.\n\n"
+            "Введи своё имя:"
+        )
+        await state.set_state(ProfileStates.entering_name)
+    else:
+        # Профиль есть — показываем главное меню
+        await message.answer(
+            f"💪 Привет, {profile['name']}! Я твой персональный тренер.\n\n"
+            "🏋️ Как записывать тренировки:\n"
+            "• Жим лежа 80-10 (упражнение вес-повторы)\n"
+            "• Подтягивания 12 (свой вес)\n"
+            "• Подтягивания с весом 15-10 (доп. вес)\n"
+            "• Бег 5 минут\n\n"
+            "Выбери действие:",
+            reply_markup=get_main_menu()
+        )
 
 @dp.message(F.text.lower().in_(["привет", "хай", "hi", "hello", "здравствуй", "здравствуйте", "прив"]))
-async def greeting(message: types.Message):
+async def greeting(message: types.Message, state: FSMContext):
+    await cmd_start(message, state)
+
+@dp.message(ProfileStates.entering_name)
+async def process_name(message: types.Message, state: FSMContext):
+    name = message.text.strip()
+    if len(name) < 2:
+        await message.answer("❌ Имя слишком короткое. Введи своё имя:")
+        return
+    
+    await state.update_data(name=name)
     await message.answer(
-        "💪 Привет! Я твой персональный тренер.\n\n"
-        "🏋️ Как записывать тренировки:\n"
-        "• Жим лежа 80-10 (упражнение вес-повторы)\n"
-        "• Бег 5 минут\n"
-        "• Планка 60 секунд\n\n"
-        "Выбери действие:",
+        f"Отлично, {name}! 👋\n\nВыбери свой пол:",
+        reply_markup=get_gender_keyboard()
+    )
+    await state.set_state(ProfileStates.entering_gender)
+
+@dp.callback_query(F.data.startswith("gender_"))
+async def process_gender(callback: types.CallbackQuery, state: FSMContext):
+    gender = "М" if callback.data == "gender_m" else "Ж"
+    await state.update_data(gender=gender)
+    
+    await callback.message.answer(
+        "📅 Введи дату рождения в формате ДД.ММ.ГГГГ\n"
+        "Например: 15.06.1990"
+    )
+    await state.set_state(ProfileStates.entering_birthdate)
+    await callback.answer()
+
+@dp.message(ProfileStates.entering_birthdate)
+async def process_birthdate(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    
+    # Проверяем формат даты
+    try:
+        birthdate = datetime.strptime(text, '%d.%m.%Y')
+        age = calculate_age(text)
+        
+        if age < 10 or age > 100:
+            await message.answer("❌ Проверь дату рождения. Введи в формате ДД.ММ.ГГГГ:")
+            return
+            
+    except ValueError:
+        await message.answer("❌ Неверный формат. Введи дату в формате ДД.ММ.ГГГГ\nНапример: 15.06.1990")
+        return
+    
+    await state.update_data(birthdate=text)
+    await message.answer(
+        "⚖️ Введи свой текущий вес в кг:\n"
+        "Например: 75"
+    )
+    await state.set_state(ProfileStates.entering_weight)
+
+@dp.message(ProfileStates.entering_weight)
+async def process_weight(message: types.Message, state: FSMContext):
+    try:
+        weight = float(message.text.strip().replace(',', '.'))
+        if weight < 30 or weight > 300:
+            await message.answer("❌ Проверь вес. Введи число от 30 до 300:")
+            return
+    except ValueError:
+        await message.answer("❌ Введи вес числом, например: 75")
+        return
+    
+    data = await state.get_data()
+    user_id = message.from_user.id
+    
+    # Сохраняем профиль
+    create_user_profile(user_id, data['name'], data['gender'], data['birthdate'])
+    add_user_weight(user_id, weight)
+    
+    await state.clear()
+    
+    age = calculate_age(data['birthdate'])
+    
+    await message.answer(
+        f"✅ Профиль создан!\n\n"
+        f"👤 Имя: {data['name']}\n"
+        f"⚧ Пол: {data['gender']}\n"
+        f"🎂 Возраст: {age} лет\n"
+        f"⚖️ Вес: {weight} кг\n\n"
+        f"💪 Теперь можешь начать тренировку!",
         reply_markup=get_main_menu()
     )
 
-# ============ НАЧАЛО ТРЕНИРОВКИ С ПРОВЕРКАМИ ============
+@dp.message(ProfileStates.updating_weight)
+async def process_weight_update(message: types.Message, state: FSMContext):
+    """Обновление веса после тренировки"""
+    try:
+        new_weight = float(message.text.strip().replace(',', '.'))
+        if new_weight < 30 or new_weight > 300:
+            await message.answer("❌ Проверь вес. Введи число от 30 до 300:")
+            return
+    except ValueError:
+        await message.answer("❌ Введи вес числом, например: 75")
+        return
+    
+    user_id = message.from_user.id
+    
+    # Получаем предыдущие веса
+    previous_weight = get_user_current_weight(user_id)
+    first_weight = get_user_first_weight(user_id)
+    
+    # Сохраняем новый вес
+    add_user_weight(user_id, new_weight)
+    
+    # Вычисляем разницу
+    month_diff = new_weight - previous_weight if previous_weight else 0
+    total_diff = new_weight - first_weight if first_weight else 0
+    
+    # Формируем сообщение
+    result_msg = f"✅ Вес обновлён: {new_weight} кг\n\n"
+    
+    if month_diff > 0:
+        result_msg += f"📈 За месяц: +{month_diff:.1f} кг\n"
+    elif month_diff < 0:
+        result_msg += f"📉 За месяц: {month_diff:.1f} кг — отлично! 🎉\n"
+    else:
+        result_msg += f"➡️ За месяц: вес не изменился\n"
+    
+    if first_weight and first_weight != previous_weight:
+        if total_diff > 0:
+            result_msg += f"📊 Итого с начала: +{total_diff:.1f} кг"
+        elif total_diff < 0:
+            result_msg += f"📊 Итого с начала: {total_diff:.1f} кг — поздравляю! 🏆"
+        else:
+            result_msg += f"📊 Итого с начала: вес не изменился"
+    
+    await state.clear()
+    await message.answer(result_msg, reply_markup=get_main_menu())
+
+# ============ КОМАНДА /profile ============
+
+@dp.message(Command("profile"))
+async def cmd_profile(message: types.Message):
+    await show_profile(message.from_user.id, message)
+
+@dp.callback_query(F.data == "profile")
+async def cb_profile(callback: types.CallbackQuery):
+    await show_profile(callback.from_user.id, callback.message)
+    await callback.answer()
+
+async def show_profile(user_id: int, message: types.Message):
+    profile = get_user_profile(user_id)
+    
+    if not profile:
+        await message.answer("❌ Профиль не найден. Напиши /start чтобы создать.")
+        return
+    
+    weight = get_user_current_weight(user_id)
+    first_weight = get_user_first_weight(user_id)
+    age = calculate_age(profile['birthdate'])
+    
+    text = f"👤 Твой профиль:\n\n"
+    text += f"📝 Имя: {profile['name']}\n"
+    text += f"⚧ Пол: {profile['gender']}\n"
+    text += f"🎂 Возраст: {age} лет\n"
+    text += f"⚖️ Текущий вес: {weight} кг\n"
+    
+    if first_weight and first_weight != weight:
+        diff = weight - first_weight
+        text += f"📊 Изменение веса: {'+' if diff > 0 else ''}{diff:.1f} кг\n"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚖️ Обновить вес", callback_data="update_weight")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
+    ])
+    
+    await message.answer(text, reply_markup=keyboard)
+
+@dp.callback_query(F.data == "update_weight")
+async def cb_update_weight(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("⚖️ Введи свой текущий вес в кг:")
+    await state.set_state(ProfileStates.updating_weight)
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_menu")
+async def cb_back_to_menu(callback: types.CallbackQuery):
+    await callback.message.answer("Выбери действие:", reply_markup=get_main_menu())
+    await callback.answer()
+
+# ============ НАЧАЛО ТРЕНИРОВКИ ============
 
 @dp.callback_query(F.data == "start_workout")
 async def cb_start_workout(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     
-    # Проверка 1: Уже идёт тренировка в FSM?
+    # Проверяем профиль
+    profile = get_user_profile(user_id)
+    if not profile:
+        await callback.message.answer(
+            "❌ Сначала создай профиль!\n\nВведи своё имя:"
+        )
+        await state.set_state(ProfileStates.entering_name)
+        await callback.answer()
+        return
+    
+    # Проверка FSM состояния
     current_state = await state.get_state()
     if current_state == WorkoutStates.entering_sets.state:
         await callback.message.answer(
@@ -413,7 +1017,7 @@ async def cb_start_workout(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     
-    # Проверка 2: Есть незавершённая тренировка в БД?
+    # Проверка незавершённой тренировки в БД
     unfinished = get_unfinished_workout(user_id)
     if unfinished:
         start_time = datetime.fromisoformat(unfinished['start_time'])
@@ -429,25 +1033,28 @@ async def cb_start_workout(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     
-    # Всё чисто — начинаем новую тренировку
-    await start_new_workout(callback.from_user.id, callback.message, state)
+    # Начинаем новую тренировку
+    await start_new_workout(user_id, callback.message, state)
     await callback.answer()
 
 @dp.message(Command("start_workout"))
 async def cmd_start_workout(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
-    # Проверка 1: Уже идёт тренировка в FSM?
+    profile = get_user_profile(user_id)
+    if not profile:
+        await message.answer("❌ Сначала создай профиль!\n\nВведи своё имя:")
+        await state.set_state(ProfileStates.entering_name)
+        return
+    
     current_state = await state.get_state()
     if current_state == WorkoutStates.entering_sets.state:
         await message.answer(
-            "⚠️ У тебя уже идёт тренировка!\n\n"
-            "Продолжай вводить упражнения или заверши её:",
+            "⚠️ У тебя уже идёт тренировка!",
             reply_markup=get_workout_menu()
         )
         return
     
-    # Проверка 2: Есть незавершённая тренировка в БД?
     unfinished = get_unfinished_workout(user_id)
     if unfinished:
         start_time = datetime.fromisoformat(unfinished['start_time'])
@@ -456,26 +1063,26 @@ async def cmd_start_workout(message: types.Message, state: FSMContext):
         await message.answer(
             f"⚠️ У тебя есть незавершённая тренировка!\n\n"
             f"📅 Начата: {start_time.strftime('%d.%m.%Y в %H:%M')}\n"
-            f"📝 Упражнений записано: {exercises_count}\n\n"
-            f"Что сделать с ней?",
+            f"📝 Упражнений: {exercises_count}\n\n"
+            f"Что сделать?",
             reply_markup=get_unfinished_workout_menu(unfinished['workout_id'])
         )
         return
     
-    # Всё чисто — начинаем новую тренировку
-    await start_new_workout(message.from_user.id, message, state)
+    await start_new_workout(user_id, message, state)
 
 async def start_new_workout(user_id: int, message: types.Message, state: FSMContext):
     """Создаёт новую тренировку"""
     workout_id = f"{user_id}_{datetime.now().timestamp()}"
-    start_time = datetime.now().isoformat()
+    start_time = datetime.now(TIMEZONE).isoformat()
+    workout_number = get_next_workout_number(user_id)
     
-    # Сразу записываем в БД (с end_time = NULL)
+    # Записываем в БД
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
-    c.execute('''INSERT INTO workouts (user_id, workout_id, start_time, end_time, duration_minutes)
-                 VALUES (?, ?, ?, NULL, NULL)''',
-              (user_id, workout_id, start_time))
+    c.execute('''INSERT INTO workouts (user_id, workout_id, workout_number, start_time, end_time, duration_minutes)
+                 VALUES (?, ?, ?, ?, NULL, NULL)''',
+              (user_id, workout_id, workout_number, start_time))
     conn.commit()
     conn.close()
     
@@ -489,16 +1096,20 @@ async def start_new_workout(user_id: int, message: types.Message, state: FSMCont
     )
     await state.set_state(WorkoutStates.entering_sets)
     
+    # Планируем напоминание через 2 часа
+    schedule_workout_reminder(user_id, workout_id)
+    
+    current_time = datetime.now(TIMEZONE).strftime('%H:%M')
+    
     await message.answer(
-        "🏋️ Тренировка начата!\n"
-        f"⏱ Время: {datetime.now().strftime('%H:%M')}\n\n"
+        f"🏋️ Тренировка #{workout_number} начата!\n"
+        f"⏱ Время: {current_time}\n\n"
         "Вводи упражнения:\n"
         "• Жим лежа 80-10\n"
-        "• Бег 5 минут\n"
-        "• 80-10 (следующий подход)",
+        "• Подтягивания 12 (свой вес)\n"
+        "• Бег 5 минут",
         reply_markup=get_workout_menu()
     )
-
 # ============ ОБРАБОТКА НЕЗАВЕРШЁННОЙ ТРЕНИРОВКИ ============
 
 @dp.callback_query(F.data.startswith("continue_workout:"))
@@ -506,24 +1117,24 @@ async def cb_continue_workout(callback: types.CallbackQuery, state: FSMContext):
     """Продолжить незавершённую тренировку"""
     workout_id = callback.data.split(":")[1]
     
-    # Получаем данные тренировки
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
-    c.execute('SELECT start_time FROM workouts WHERE workout_id = ?', (workout_id,))
+    c.execute('SELECT start_time, workout_number FROM workouts WHERE workout_id = ?', (workout_id,))
     result = c.fetchone()
     
     if not result:
         await callback.message.answer("❌ Тренировка не найдена")
         await callback.answer()
+        conn.close()
         return
+    
+    start_time, workout_number = result
     
     # Получаем последнее упражнение
     c.execute('''SELECT id, exercise_name FROM exercises 
-                 WHERE workout_id = ? 
-                 ORDER BY id DESC LIMIT 1''', (workout_id,))
+                 WHERE workout_id = ? ORDER BY id DESC LIMIT 1''', (workout_id,))
     last_exercise = c.fetchone()
     
-    # Считаем подходы последнего упражнения
     set_count = 0
     current_exercise_id = None
     current_exercise = None
@@ -536,23 +1147,25 @@ async def cb_continue_workout(callback: types.CallbackQuery, state: FSMContext):
     
     conn.close()
     
-    # Восстанавливаем FSM состояние
     await state.update_data(
         workout_id=workout_id,
-        start_time=result[0],
+        start_time=start_time,
         current_exercise=current_exercise,
         current_exercise_id=current_exercise_id,
         set_count=set_count
     )
     await state.set_state(WorkoutStates.entering_sets)
     
+    # Перепланируем напоминание
+    schedule_workout_reminder(callback.from_user.id, workout_id)
+    
     exercises_count = get_workout_exercises_count(workout_id)
     
     await callback.message.answer(
-        f"🔄 Продолжаем тренировку!\n\n"
-        f"📝 Уже записано упражнений: {exercises_count}\n"
+        f"🔄 Продолжаем тренировку #{workout_number}!\n\n"
+        f"📝 Записано упражнений: {exercises_count}\n"
         f"{'📍 Последнее: ' + current_exercise if current_exercise else ''}\n\n"
-        f"Вводи следующее упражнение или подход:",
+        f"Вводи следующее упражнение:",
         reply_markup=get_workout_menu()
     )
     await callback.answer()
@@ -562,6 +1175,7 @@ async def cb_finish_old_workout(callback: types.CallbackQuery, state: FSMContext
     """Завершить незавершённую тренировку"""
     workout_id = callback.data.split(":")[1]
     
+    cancel_workout_reminders(workout_id)
     stats = finish_workout_in_db(workout_id, callback.from_user.id)
     
     if 'error' in stats:
@@ -576,23 +1190,56 @@ async def cb_finish_old_workout(callback: types.CallbackQuery, state: FSMContext
         f"⏱ Длительность: {stats['duration']} минут\n"
         f"📊 Выполнено: {stats['exercises_count']} упражнений, {stats['sets_count']} подходов\n"
         f"💪 Общий тоннаж: {tonnage_str} кг\n\n"
-        f"Теперь можешь начать новую тренировку!",
+        f"Теперь можешь начать новую!",
         reply_markup=get_main_menu()
     )
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("cancel_workout:"))
 async def cb_cancel_workout(callback: types.CallbackQuery, state: FSMContext):
-    """Отменить незавершённую тренировку"""
+    """Отменить тренировку"""
     workout_id = callback.data.split(":")[1]
     
+    cancel_workout_reminders(workout_id)
     cancel_workout_in_db(workout_id)
     await state.clear()
     
     await callback.message.answer(
-        "❌ Тренировка отменена и удалена.\n\n"
-        "Можешь начать новую!",
+        "❌ Тренировка отменена и удалена.\n\nМожешь начать новую!",
         reply_markup=get_main_menu()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "continue_training")
+async def cb_continue_training(callback: types.CallbackQuery):
+    """Пользователь нажал 'Ещё тренируюсь' на напоминании"""
+    # Отменяем автозавершение
+    data = await callback.message.bot.get_chat(callback.from_user.id)
+    
+    # Ищем активную тренировку
+    unfinished = get_unfinished_workout(callback.from_user.id)
+    if unfinished:
+        workout_id = unfinished['workout_id']
+        # Отменяем автозавершение
+        try:
+            scheduler.remove_job(f"auto_finish_{workout_id}")
+        except:
+            pass
+        
+        # Планируем новое напоминание через 1 час
+        run_time = datetime.now(TIMEZONE) + timedelta(hours=1)
+        scheduler.add_job(
+            send_workout_reminder,
+            DateTrigger(run_date=run_time),
+            args=[callback.from_user.id, workout_id],
+            id=f"reminder_{workout_id}",
+            replace_existing=True
+        )
+    
+    await callback.message.answer(
+        "💪 Отлично! Продолжай тренировку.\n"
+        "Напомню через час.",
+        reply_markup=get_workout_menu()
     )
     await callback.answer()
 
@@ -604,68 +1251,62 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
     data = await state.get_data()
     
-    if current_state != WorkoutStates.entering_sets.state or 'workout_id' not in data:
-        # Проверяем БД на незавершённые
-        unfinished = get_unfinished_workout(message.from_user.id)
-        if unfinished:
-            cancel_workout_in_db(unfinished['workout_id'])
-            await message.answer(
-                "❌ Незавершённая тренировка отменена.\n\n"
-                "Можешь начать новую!",
-                reply_markup=get_main_menu()
-            )
-        else:
-            await message.answer("❌ Нет активной тренировки для отмены.")
+    if current_state == WorkoutStates.entering_sets.state and 'workout_id' in data:
+        workout_id = data['workout_id']
+        cancel_workout_reminders(workout_id)
+        cancel_workout_in_db(workout_id)
+        await state.clear()
+        await message.answer("❌ Тренировка отменена.", reply_markup=get_main_menu())
         return
     
-    # Отменяем текущую
-    workout_id = data['workout_id']
-    cancel_workout_in_db(workout_id)
-    await state.clear()
-    
-    await message.answer(
-        "❌ Тренировка отменена и удалена.\n\n"
-        "Можешь начать новую!",
-        reply_markup=get_main_menu()
-    )
+    # Проверяем БД
+    unfinished = get_unfinished_workout(message.from_user.id)
+    if unfinished:
+        cancel_workout_reminders(unfinished['workout_id'])
+        cancel_workout_in_db(unfinished['workout_id'])
+        await message.answer("❌ Незавершённая тренировка отменена.", reply_markup=get_main_menu())
+    else:
+        await message.answer("❌ Нет активной тренировки для отмены.")
 
 # ============ ВВОД УПРАЖНЕНИЙ ============
 
 @dp.callback_query(F.data == "ask_question")
 async def ask_question_callback(callback: types.CallbackQuery):
-    await callback.message.answer("💡 Задай свой вопрос следующим сообщением.")
+    await callback.message.answer("💡 Задай свой вопрос:")
     await callback.answer()
 
 @dp.message(WorkoutStates.entering_sets)
 async def process_workout_entry(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    
     # Проверяем не вопрос ли это
-    question_words = ['как', 'что', 'чем', 'почему', 'когда', 'стоит', 'можно', 'нужно', 'заменить', 'посоветуй']
-    if any(word in message.text.lower() for word in question_words) and len(message.text.split()) > 2:
+    question_words = ['как', 'что', 'чем', 'почему', 'когда', 'стоит', 'можно', 'нужно', 'заменить', 'посоветуй', '?']
+    if any(word in text.lower() for word in question_words) and len(text.split()) > 2:
         await message.answer("🤔 Думаю...")
-        answer = await ask_gigachat(message.from_user.id, message.text)
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💬 Ещё вопрос", callback_data="ask_question")],
-            [InlineKeyboardButton(text="🏁 Завершить тренировку", callback_data="end_workout")]
-        ])
-        
-        await message.answer(answer, reply_markup=keyboard)
+        answer = await ask_gigachat(message.from_user.id, text)
+        await message.answer(answer, reply_markup=get_workout_menu())
         return
     
-    exercise_name, weight, reps, duration, set_type = parse_workout_input(message.text)
+    # Получаем вес пользователя для упражнений с собственным весом
+    user_weight = get_user_current_weight(message.from_user.id) or 0
+    
+    exercise_name, weight, reps, duration, set_type = parse_workout_input(text, user_weight)
     
     if set_type == 'unknown':
         await message.answer(
-            "❌ Не понял формат. Попробуй:\n"
-            "• Жим лежа 80-10\n"
-            "• 80-10 (продолжить упражнение)\n"
-            "• Бег 5 минут"
+            "❌ Не понял формат. Примеры:\n"
+            "• Жим лежа 80-10 (вес-повторы)\n"
+            "• Подтягивания 12 (свой вес)\n"
+            "• Подтягивания с весом 15-10\n"
+            "• Бег 5 минут\n"
+            "• 80-10 (продолжить упражнение)"
         )
         return
     
     data = await state.get_data()
     workout_id = data['workout_id']
     current_exercise_id = data.get('current_exercise_id')
+    current_exercise = data.get('current_exercise')
     set_count = data.get('set_count', 0)
     
     conn = sqlite3.connect('workouts.db')
@@ -673,12 +1314,15 @@ async def process_workout_entry(message: types.Message, state: FSMContext):
     
     # Если указано название упражнения — создаём новое
     if exercise_name:
-        c.execute('''INSERT INTO exercises (workout_id, exercise_name, timestamp)
-                     VALUES (?, ?, ?)''',
-                  (workout_id, exercise_name, datetime.now().isoformat()))
+        # Определяем группу мышц
+        muscle_group = await get_muscle_group(exercise_name)
+        
+        c.execute('''INSERT INTO exercises (workout_id, exercise_name, muscle_group, timestamp)
+                     VALUES (?, ?, ?, ?)''',
+                  (workout_id, exercise_name, muscle_group, datetime.now(TIMEZONE).isoformat()))
         current_exercise_id = c.lastrowid
         current_exercise = exercise_name
-        set_count = 0  # Сброс счётчика при новом упражнении
+        set_count = 0
         
         await state.update_data(
             current_exercise=exercise_name,
@@ -689,13 +1333,11 @@ async def process_workout_entry(message: types.Message, state: FSMContext):
         await message.answer("❌ Сначала укажи упражнение: Жим лежа 80-10")
         conn.close()
         return
-    else:
-        current_exercise = data.get('current_exercise')
     
     # Сохраняем подход
     c.execute('''INSERT INTO sets (exercise_id, weight_kg, reps, duration_seconds, set_type, timestamp)
                  VALUES (?, ?, ?, ?, ?, ?)''',
-              (current_exercise_id, weight, reps, duration, set_type, datetime.now().isoformat()))
+              (current_exercise_id, weight, reps, duration, set_type, datetime.now(TIMEZONE).isoformat()))
     conn.commit()
     conn.close()
     
@@ -704,12 +1346,14 @@ async def process_workout_entry(message: types.Message, state: FSMContext):
     
     # Формируем ответ
     if set_type == 'strength':
-        response = f"✅ {current_exercise} — Подход {set_count}: {weight} кг x {reps} раз"
+        response = f"✅ {current_exercise} — Подход {set_count}: {weight} кг × {reps} раз"
     elif set_type == 'cardio':
         mins = duration // 60
-        response = f"✅ {current_exercise}: {mins} минут"
+        response = f"✅ {current_exercise}: {mins} мин"
+    elif set_type == 'static':
+        response = f"✅ {current_exercise}: {duration} сек"
     else:
-        response = f"✅ {current_exercise}: {duration} секунд"
+        response = f"✅ {current_exercise} записано"
     
     await message.answer(response, reply_markup=get_workout_menu())
 
@@ -725,9 +1369,13 @@ async def end_workout(callback: types.CallbackQuery, state: FSMContext):
         return
     
     workout_id = data['workout_id']
+    user_id = callback.from_user.id
     
-    # Используем функцию завершения
-    stats = finish_workout_in_db(workout_id, callback.from_user.id)
+    # Отменяем напоминания
+    cancel_workout_reminders(workout_id)
+    
+    # Завершаем тренировку
+    stats = finish_workout_in_db(workout_id, user_id)
     
     if 'error' in stats:
         await callback.message.answer(f"❌ {stats['error']}")
@@ -738,13 +1386,24 @@ async def end_workout(callback: types.CallbackQuery, state: FSMContext):
     
     tonnage_str = f"{stats['tonnage']:.0f}" if stats['tonnage'] else "0"
     
-    await callback.message.answer(
-        f"🏁 Тренировка завершена!\n"
-        f"⏱ Длительность: {stats['duration']} минут\n"
-        f"📊 Выполнено: {stats['exercises_count']} упражнений, {stats['sets_count']} подходов\n"
-        f"💪 Общий тоннаж: {tonnage_str} кг",
-        reply_markup=get_main_menu()
+    result_msg = (
+        f"🏁 Тренировка завершена!\n\n"
+        f"⏱ Длительность: {stats['duration']} мин\n"
+        f"📊 Упражнений: {stats['exercises_count']}, подходов: {stats['sets_count']}\n"
+        f"💪 Тоннаж: {tonnage_str} кг"
     )
+    
+    # Проверяем, нужно ли обновить вес
+    if needs_weight_update(user_id):
+        await callback.message.answer(result_msg)
+        await callback.message.answer(
+            "⚖️ Прошло больше месяца с последнего взвешивания.\n"
+            "Введи свой текущий вес в кг:"
+        )
+        await state.set_state(ProfileStates.updating_weight)
+    else:
+        await callback.message.answer(result_msg, reply_markup=get_main_menu())
+    
     await callback.answer()
 
 # ============ СТАТИСТИКА ============
@@ -762,12 +1421,12 @@ async def show_stats(user_id: int, message: types.Message):
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
     
-    # Общая статистика за всё время (только завершённые)
+    # Общая статистика
     c.execute('''SELECT COUNT(*), SUM(duration_minutes)
                  FROM workouts WHERE user_id = ? AND end_time IS NOT NULL''', (user_id,))
     total_workouts, total_minutes = c.fetchone()
     
-    # Рекорды по ВСЕМ упражнениям
+    # Рекорды
     c.execute('''SELECT e.exercise_name, MAX(s.weight_kg)
                  FROM workouts w
                  JOIN exercises e ON w.workout_id = e.workout_id
@@ -779,16 +1438,16 @@ async def show_stats(user_id: int, message: types.Message):
     
     conn.close()
     
-    stats = f"📊 Статистика за всё время:\n\n"
-    stats += f"Всего тренировок: {total_workouts or 0}\n"
-    stats += f"Общее время: {total_minutes or 0} минут\n\n"
+    stats = f"📊 Статистика:\n\n"
+    stats += f"🏋️ Тренировок: {total_workouts or 0}\n"
+    stats += f"⏱ Общее время: {total_minutes or 0} мин\n\n"
     
     if records:
-        stats += "🏆 Рекорды по весам:\n"
-        for name, weight in records:
+        stats += "🏆 Рекорды:\n"
+        for name, weight in records[:10]:
             stats += f"• {name}: {weight} кг\n"
     else:
-        stats += "Пока нет записей с весами"
+        stats += "Пока нет записей"
     
     await message.answer(stats)
 
@@ -804,16 +1463,14 @@ async def cmd_history(message: types.Message):
     await show_history(message.from_user.id, message)
 
 async def show_history(user_id: int, message: types.Message):
-    # Определяем начало недели (понедельник)
-    today = datetime.now().date()
+    today = datetime.now(TIMEZONE).date()
     start_of_week = today - timedelta(days=today.weekday())
     end_of_week = start_of_week + timedelta(days=6)
     
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
     
-    # Только завершённые тренировки
-    c.execute('''SELECT w.workout_id, w.start_time, w.duration_minutes
+    c.execute('''SELECT w.workout_id, w.workout_number, w.start_time, w.duration_minutes
                  FROM workouts w
                  WHERE w.user_id = ? AND date(w.start_time) >= ? AND date(w.start_time) <= ?
                    AND w.end_time IS NOT NULL
@@ -824,25 +1481,21 @@ async def show_history(user_id: int, message: types.Message):
     
     if not workouts:
         await message.answer(
-            f"📅 Тренировки за неделю ({start_of_week.strftime('%d.%m')} - {end_of_week.strftime('%d.%m.%Y')}):\n\n"
-            "Пока нет тренировок на этой неделе.\n"
-            "Начни с /start_workout!"
+            f"📅 Неделя ({start_of_week.strftime('%d.%m')} - {end_of_week.strftime('%d.%m')}):\n\n"
+            "Пока нет тренировок.\nНачни с /start_workout!"
         )
         conn.close()
         return
     
-    history = f"📅 Тренировки за неделю ({start_of_week.strftime('%d.%m')} - {end_of_week.strftime('%d.%m.%Y')}):\n\n"
+    history = f"📅 Неделя ({start_of_week.strftime('%d.%m')} - {end_of_week.strftime('%d.%m')}):\n\n"
     
-    weekdays = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
-    
-    for idx, (workout_id, start_time, duration) in enumerate(workouts, 1):
+    for workout_id, workout_num, start_time, duration in workouts:
         dt = datetime.fromisoformat(start_time)
-        weekday = weekdays[dt.weekday()]
+        weekday = WEEKDAYS_RU[dt.weekday()]
         
-        history += f"Тренировка {idx} — {weekday} {dt.strftime('%d.%m')}\n"
+        history += f"🏋️ Тренировка #{workout_num} — {weekday} {dt.strftime('%d.%m')}\n"
         
-        # Получаем упражнения
-        c.execute('''SELECT e.exercise_name, s.weight_kg, s.reps, s.duration_seconds, s.set_type
+        c.execute('''SELECT e.exercise_name, e.muscle_group, s.weight_kg, s.reps, s.duration_seconds, s.set_type
                      FROM exercises e
                      JOIN sets s ON e.id = s.exercise_id
                      WHERE e.workout_id = ?
@@ -850,24 +1503,23 @@ async def show_history(user_id: int, message: types.Message):
         
         exercises = c.fetchall()
         
-        # Группируем по упражнениям
         ex_groups = {}
-        for ex_name, weight, reps, duration_sec, set_type in exercises:
+        for ex_name, muscle, weight, reps, dur, stype in exercises:
             if ex_name not in ex_groups:
-                ex_groups[ex_name] = {'type': set_type, 'weights': [], 'reps': [], 'duration': duration_sec}
-            if set_type == 'strength':
+                ex_groups[ex_name] = {'muscle': muscle, 'type': stype, 'weights': [], 'reps': [], 'duration': dur}
+            if stype == 'strength':
                 ex_groups[ex_name]['weights'].append(int(weight) if weight else 0)
-                ex_groups[ex_name]['reps'].append(reps if reps else 0)
+                ex_groups[ex_name]['reps'].append(reps or 0)
         
         for ex_name, data in ex_groups.items():
             if data['type'] == 'strength':
-                weights_str = ' → '.join(map(str, data['weights']))
-                history += f"• {ex_name} — {len(data['weights'])} подх. ({weights_str} кг)\n"
+                weights_str = '→'.join(map(str, data['weights']))
+                history += f"  • {ex_name} ({data['muscle']}): {weights_str} кг\n"
             elif data['type'] == 'cardio':
                 mins = data['duration'] // 60 if data['duration'] else 0
-                history += f"• {ex_name} — {mins} мин\n"
-            else:
-                history += f"• {ex_name} — {data['duration']} сек\n"
+                history += f"  • {ex_name}: {mins} мин\n"
+            elif data['type'] == 'static':
+                history += f"  • {ex_name}: {data['duration']} сек\n"
         
         history += "\n"
     
@@ -886,46 +1538,59 @@ async def cmd_help(message: types.Message):
     await show_help(message)
 
 async def show_help(message: types.Message):
-    help_text = (
-        "ℹ️ Как пользоваться ботом:\n\n"
-        "🏋️ ЗАПИСЬ ТРЕНИРОВКИ\n"
-        "1. Нажми 'Начать тренировку' или /start_workout\n"
-        "2. Вводи упражнения:\n"
-        "   • Жим лежа 80-10 (название + вес-повторы)\n"
-        "   • 80-8 (следующий подход)\n"
-        "   • Бег 5 минут\n"
-        "   • Планка 60 секунд\n"
-        "3. Нажми 'Завершить тренировку'\n\n"
-        "📊 СТАТИСТИКА (/stats)\n"
-        "За всё время: количество тренировок, общее время, рекорды\n\n"
-        "📅 ИСТОРИЯ (/history)\n"
-        "Все тренировки за текущую неделю\n\n"
-        "🗑 УДАЛЕНИЕ (/delete)\n"
-        "Удаляет последний подход\n\n"
-        "❌ ОТМЕНА (/cancel)\n"
-        "Отменяет текущую тренировку\n\n"
-        "💬 ВОПРОСЫ\n"
-        "Нажми 'Задать вопрос' или просто напиши\n\n"
-        "📝 ОБРАТНАЯ СВЯЗЬ (/feedback)\n"
-        "Напиши пожелания или сообщи о баге"
-    )
+    help_text = """❓ Как пользоваться ботом:
+
+🏋️ ЗАПИСЬ ТРЕНИРОВКИ
+• Жим лежа 80-10 — вес × повторы
+• 80-8 — следующий подход
+• Подтягивания 12 — свой вес × повторы
+• Подтягивания с весом 15-10 — свой вес + 15 кг
+• Бег 5 минут — кардио
+• Планка 60 секунд — статика
+
+📊 КОМАНДЫ
+/start_workout — начать тренировку
+/stats — статистика и рекорды
+/history — тренировки за неделю
+/profile — твой профиль
+/delete — удалить последний подход
+/cancel — отменить тренировку
+/feedback — написать разработчику
+
+⏰ НАПОМИНАНИЯ
+Через 2 часа бот напомнит завершить тренировку.
+Если не ответишь — завершит автоматически.
+
+⚖️ ВЕС
+Бот просит обновить вес раз в месяц и показывает прогресс."""
     
     await message.answer(help_text)
 
 # ============ УДАЛЕНИЕ ============
 
 @dp.message(Command("delete"))
-async def cmd_delete(message: types.Message):
+async def cmd_delete(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    workout_id = data.get('workout_id')
+    
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
     
-    # Находим последний подход пользователя
-    c.execute('''SELECT s.id, e.exercise_name, s.weight_kg, s.reps
-                 FROM sets s
-                 JOIN exercises e ON s.exercise_id = e.id
-                 JOIN workouts w ON e.workout_id = w.workout_id
-                 WHERE w.user_id = ?
-                 ORDER BY s.timestamp DESC LIMIT 1''', (message.from_user.id,))
+    if workout_id:
+        # Удаляем из текущей тренировки
+        c.execute('''SELECT s.id, e.exercise_name, s.weight_kg, s.reps
+                     FROM sets s
+                     JOIN exercises e ON s.exercise_id = e.id
+                     WHERE e.workout_id = ?
+                     ORDER BY s.id DESC LIMIT 1''', (workout_id,))
+    else:
+        # Удаляем последний подход пользователя
+        c.execute('''SELECT s.id, e.exercise_name, s.weight_kg, s.reps
+                     FROM sets s
+                     JOIN exercises e ON s.exercise_id = e.id
+                     JOIN workouts w ON e.workout_id = w.workout_id
+                     WHERE w.user_id = ?
+                     ORDER BY s.timestamp DESC LIMIT 1''', (message.from_user.id,))
     
     result = c.fetchone()
     
@@ -933,7 +1598,14 @@ async def cmd_delete(message: types.Message):
         set_id, ex_name, weight, reps = result
         c.execute('DELETE FROM sets WHERE id = ?', (set_id,))
         conn.commit()
-        await message.answer(f"✅ Удалён подход: {ex_name} {weight}кг x {reps}")
+        
+        # Обновляем счётчик
+        set_count = data.get('set_count', 1) - 1
+        if set_count < 0:
+            set_count = 0
+        await state.update_data(set_count=set_count)
+        
+        await message.answer(f"🗑 Удалено: {ex_name} {weight}кг × {reps}")
     else:
         await message.answer("❌ Нет записей для удаления")
     
@@ -946,45 +1618,44 @@ async def cmd_feedback(message: types.Message):
     text = message.text.replace('/feedback', '').strip()
     
     if not text:
-        await message.answer("📝 Напиши: /feedback текст сообщения")
+        await message.answer("📝 Напиши: /feedback твоё сообщение")
         return
     
     try:
         await bot.send_message(
             ADMIN_ID,
-            f"📢 Feedback от пользователя {message.from_user.id}:\n"
+            f"📢 Feedback от {message.from_user.id}:\n"
             f"Имя: {message.from_user.full_name}\n"
-            f"Username: @{message.from_user.username}\n\n"
-            f"{text}"
+            f"@{message.from_user.username}\n\n{text}"
         )
-        await message.answer("✅ Сообщение отправлено разработчику")
+        await message.answer("✅ Сообщение отправлено!")
     except Exception as e:
-        logger.error(f"Ошибка отправки feedback: {e}")
-        await message.answer("❌ Ошибка отправки сообщения")
+        logger.error(f"Feedback error: {e}")
+        await message.answer("❌ Ошибка отправки")
 
 # ============ АДМИНСКИЕ КОМАНДЫ ============
 
 @dp.message(Command("export"))
 async def cmd_export(message: types.Message):
     if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ Команда недоступна")
+        await message.answer("❌ Недоступно")
         return
     
     try:
         file = FSInputFile('workouts.db')
-        await message.answer_document(file, caption="📦 База данных workouts.db")
+        await message.answer_document(file, caption="📦 База данных")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
 
 @dp.message(Command("sync"))
 async def cmd_sync(message: types.Message):
     if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ Команда недоступна")
+        await message.answer("❌ Недоступно")
         return
     
-    await message.answer("🔄 Синхронизация с Google Sheets...")
+    await message.answer("🔄 Синхронизация...")
     await sync_to_google_sheets()
-    await message.answer("✅ Синхронизация завершена!")
+    await message.answer("✅ Готово!")
 
 # ============ ОБРАБОТКА ОСТАЛЬНЫХ СООБЩЕНИЙ ============
 
@@ -995,7 +1666,14 @@ async def handle_any_message(message: types.Message, state: FSMContext):
     if current_state:
         return
     
-    question_words = ['как', 'что', 'чем', 'почему', 'когда', 'стоит', 'можно', 'нужно', 'заменить', 'посоветуй', 'подскажи', '?']
+    # Проверяем профиль
+    profile = get_user_profile(message.from_user.id)
+    if not profile:
+        await message.answer("👋 Привет! Для начала создай профиль.\n\nВведи своё имя:")
+        await state.set_state(ProfileStates.entering_name)
+        return
+    
+    question_words = ['как', 'что', 'чем', 'почему', 'когда', 'стоит', 'можно', 'нужно', 'заменить', 'посоветуй', '?']
     
     if any(word in message.text.lower() for word in question_words):
         await message.answer("🤔 Думаю...")
@@ -1003,42 +1681,26 @@ async def handle_any_message(message: types.Message, state: FSMContext):
         await message.answer(answer)
     else:
         await message.answer(
-            "Не понял команду. Напиши 'Привет' для начала или /help для справки",
+            "Не понял. Напиши 'Привет' или /help",
             reply_markup=get_main_menu()
         )
 
 # ============ MAIN ============
 
 async def main():
-    logger.info("🚀 Бот запущен!")
+    logger.info("🚀 Бот запускается...")
     
-    # Настраиваем Google Sheets
-    try:
-        client = get_google_sheets_client()
-        if client and GOOGLE_SPREADSHEET_ID:
-            sheet = client.open_by_key(GOOGLE_SPREADSHEET_ID)
-            try:
-                worksheet = sheet.worksheet("Data")
-                logger.info("✅ Лист Data найден")
-            except:
-                worksheet = sheet.add_worksheet(title="Data", rows=1000, cols=10)
-                worksheet.append_row(["User ID", "Дата", "Время начала", "Время конца", 
-                                      "Длительность (мин)", "Упражнение", "Вес (кг)", 
-                                      "Повторы", "Длительность (сек)", "Тип"])
-                logger.info("✅ Создан лист Data в Google Sheets")
-    except Exception as e:
-        logger.error(f"❌ Ошибка настройки Google Sheets: {e}")
-    
-    # Запускаем планировщик синхронизации (каждый день в 23:59 МСК)
+    # Запускаем планировщик
     scheduler.add_job(
         sync_to_google_sheets,
-        CronTrigger(hour=23, minute=59, timezone=pytz.timezone('Europe/Moscow')),
+        CronTrigger(hour=23, minute=59, timezone=TIMEZONE),
         id='daily_sync',
         replace_existing=True
     )
     scheduler.start()
-    logger.info("✅ Планировщик синхронизации запущен (23:59 МСК)")
+    logger.info("✅ Планировщик запущен (синхронизация в 23:59 МСК)")
     
+    # Запускаем бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
