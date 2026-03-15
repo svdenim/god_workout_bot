@@ -78,7 +78,97 @@ def init_db():
 
 init_db()
 
-# Google Sheets
+# ============ ПРОВЕРКА НЕЗАВЕРШЁННЫХ ТРЕНИРОВОК ============
+
+def get_unfinished_workout(user_id: int) -> Optional[dict]:
+    """Проверяет есть ли незавершённая тренировка (end_time IS NULL)"""
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    
+    c.execute('''SELECT workout_id, start_time 
+                 FROM workouts 
+                 WHERE user_id = ? AND end_time IS NULL
+                 ORDER BY start_time DESC 
+                 LIMIT 1''', (user_id,))
+    
+    result = c.fetchone()
+    conn.close()
+    
+    if result:
+        return {'workout_id': result[0], 'start_time': result[1]}
+    return None
+
+def get_workout_exercises_count(workout_id: str) -> int:
+    """Подсчитывает количество упражнений в тренировке"""
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('SELECT COUNT(*) FROM exercises WHERE workout_id = ?', (workout_id,))
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+def finish_workout_in_db(workout_id: str, user_id: int) -> dict:
+    """Завершает тренировку в БД и возвращает статистику"""
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    
+    # Получаем время начала
+    c.execute('SELECT start_time FROM workouts WHERE workout_id = ?', (workout_id,))
+    result = c.fetchone()
+    
+    if not result:
+        conn.close()
+        return {'error': 'Тренировка не найдена'}
+    
+    start_time = datetime.fromisoformat(result[0])
+    end_time = datetime.now()
+    duration = int((end_time - start_time).total_seconds() / 60)
+    
+    # Обновляем тренировку
+    c.execute('''UPDATE workouts 
+                 SET end_time = ?, duration_minutes = ?
+                 WHERE workout_id = ?''',
+              (end_time.isoformat(), duration, workout_id))
+    
+    # Получаем статистику
+    c.execute('''SELECT COUNT(DISTINCT e.id), COUNT(s.id), 
+                        SUM(CASE WHEN s.set_type = 'strength' THEN s.weight_kg * s.reps ELSE 0 END)
+                 FROM exercises e
+                 LEFT JOIN sets s ON e.id = s.exercise_id
+                 WHERE e.workout_id = ?''', (workout_id,))
+    exercises_count, sets_count, tonnage = c.fetchone()
+    
+    conn.commit()
+    conn.close()
+    
+    return {
+        'duration': duration,
+        'exercises_count': exercises_count or 0,
+        'sets_count': sets_count or 0,
+        'tonnage': tonnage or 0
+    }
+
+def cancel_workout_in_db(workout_id: str) -> bool:
+    """Отменяет (удаляет) незавершённую тренировку"""
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    
+    # Удаляем подходы
+    c.execute('''DELETE FROM sets WHERE exercise_id IN 
+                 (SELECT id FROM exercises WHERE workout_id = ?)''', (workout_id,))
+    
+    # Удаляем упражнения
+    c.execute('DELETE FROM exercises WHERE workout_id = ?', (workout_id,))
+    
+    # Удаляем тренировку
+    c.execute('DELETE FROM workouts WHERE workout_id = ?', (workout_id,))
+    
+    conn.commit()
+    conn.close()
+    return True
+
+# ============ GOOGLE SHEETS ============
+
 def get_google_sheets_client():
     try:
         creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS)
@@ -110,7 +200,7 @@ async def sync_to_google_sheets():
                      FROM workouts w
                      JOIN exercises e ON w.workout_id = e.workout_id
                      JOIN sets s ON e.id = s.exercise_id
-                     WHERE date(w.start_time) = ?''', (today.isoformat(),))
+                     WHERE date(w.start_time) = ? AND w.end_time IS NOT NULL''', (today.isoformat(),))
         
         rows = c.fetchall()
         conn.close()
@@ -137,7 +227,8 @@ async def sync_to_google_sheets():
     except Exception as e:
         logger.error(f"Ошибка синхронизации с Google Sheets: {e}")
 
-# Парсер упражнений
+# ============ ПАРСЕР УПРАЖНЕНИЙ ============
+
 def parse_workout_input(text: str) -> Tuple[Optional[str], Optional[float], Optional[int], Optional[int], str]:
     text = text.strip()
     
@@ -171,7 +262,8 @@ def parse_workout_input(text: str) -> Tuple[Optional[str], Optional[float], Opti
     
     return (None, None, None, None, 'unknown')
 
-# GigaChat API
+# ============ GIGACHAT API ============
+
 async def get_gigachat_token():
     if not GIGACHAT_CLIENT_ID or not GIGACHAT_CLIENT_SECRET:
         return None
@@ -254,17 +346,32 @@ async def ask_gigachat(user_id: int, question: str):
         logger.error(f"GigaChat error: {e}")
         return "Ошибка при обращении к ИИ"
 
-# Главное меню (кнопки)
+# ============ КЛАВИАТУРЫ ============
+
 def get_main_menu():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏋️ Начать тренировку", callback_data="start_workout")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
          InlineKeyboardButton(text="📅 История", callback_data="history")],
         [InlineKeyboardButton(text="❓ Помощь", callback_data="help")]
     ])
-    return keyboard
 
-# Хэндлеры
+def get_workout_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Задать вопрос", callback_data="ask_question")],
+        [InlineKeyboardButton(text="🏁 Завершить тренировку", callback_data="end_workout")]
+    ])
+
+def get_unfinished_workout_menu(workout_id: str):
+    """Меню для незавершённой тренировки"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Продолжить", callback_data=f"continue_workout:{workout_id}")],
+        [InlineKeyboardButton(text="🏁 Завершить", callback_data=f"finish_old_workout:{workout_id}")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_workout:{workout_id}")]
+    ])
+
+# ============ ХЭНДЛЕРЫ ============
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -289,41 +396,90 @@ async def greeting(message: types.Message):
         reply_markup=get_main_menu()
     )
 
+# ============ НАЧАЛО ТРЕНИРОВКИ С ПРОВЕРКАМИ ============
+
 @dp.callback_query(F.data == "start_workout")
 async def cb_start_workout(callback: types.CallbackQuery, state: FSMContext):
-    workout_id = f"{callback.from_user.id}_{datetime.now().timestamp()}"
-    start_time = datetime.now().isoformat()
+    user_id = callback.from_user.id
     
-    await state.update_data(
-        workout_id=workout_id,
-        start_time=start_time,
-        current_exercise=None,
-        current_exercise_id=None,
-        set_count=0
-    )
-    await state.set_state(WorkoutStates.entering_sets)
+    # Проверка 1: Уже идёт тренировка в FSM?
+    current_state = await state.get_state()
+    if current_state == WorkoutStates.entering_sets.state:
+        await callback.message.answer(
+            "⚠️ У тебя уже идёт тренировка!\n\n"
+            "Продолжай вводить упражнения или заверши её:",
+            reply_markup=get_workout_menu()
+        )
+        await callback.answer()
+        return
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Задать вопрос", callback_data="ask_question")],
-        [InlineKeyboardButton(text="🏁 Завершить тренировку", callback_data="end_workout")]
-    ])
+    # Проверка 2: Есть незавершённая тренировка в БД?
+    unfinished = get_unfinished_workout(user_id)
+    if unfinished:
+        start_time = datetime.fromisoformat(unfinished['start_time'])
+        exercises_count = get_workout_exercises_count(unfinished['workout_id'])
+        
+        await callback.message.answer(
+            f"⚠️ У тебя есть незавершённая тренировка!\n\n"
+            f"📅 Начата: {start_time.strftime('%d.%m.%Y в %H:%M')}\n"
+            f"📝 Упражнений записано: {exercises_count}\n\n"
+            f"Что сделать с ней?",
+            reply_markup=get_unfinished_workout_menu(unfinished['workout_id'])
+        )
+        await callback.answer()
+        return
     
-    await callback.message.answer(
-        "🏋️ Тренировка начата!\n"
-        f"⏱ Время: {datetime.now().strftime('%H:%M')}\n\n"
-        "Вводи упражнения:\n"
-        "• Жим лежа 80-10\n"
-        "• Бег 5 минут\n"
-        "• 80-10 (следующий подход)",
-        reply_markup=keyboard
-    )
+    # Всё чисто — начинаем новую тренировку
+    await start_new_workout(callback.from_user.id, callback.message, state)
     await callback.answer()
 
 @dp.message(Command("start_workout"))
 async def cmd_start_workout(message: types.Message, state: FSMContext):
-    workout_id = f"{message.from_user.id}_{datetime.now().timestamp()}"
+    user_id = message.from_user.id
+    
+    # Проверка 1: Уже идёт тренировка в FSM?
+    current_state = await state.get_state()
+    if current_state == WorkoutStates.entering_sets.state:
+        await message.answer(
+            "⚠️ У тебя уже идёт тренировка!\n\n"
+            "Продолжай вводить упражнения или заверши её:",
+            reply_markup=get_workout_menu()
+        )
+        return
+    
+    # Проверка 2: Есть незавершённая тренировка в БД?
+    unfinished = get_unfinished_workout(user_id)
+    if unfinished:
+        start_time = datetime.fromisoformat(unfinished['start_time'])
+        exercises_count = get_workout_exercises_count(unfinished['workout_id'])
+        
+        await message.answer(
+            f"⚠️ У тебя есть незавершённая тренировка!\n\n"
+            f"📅 Начата: {start_time.strftime('%d.%m.%Y в %H:%M')}\n"
+            f"📝 Упражнений записано: {exercises_count}\n\n"
+            f"Что сделать с ней?",
+            reply_markup=get_unfinished_workout_menu(unfinished['workout_id'])
+        )
+        return
+    
+    # Всё чисто — начинаем новую тренировку
+    await start_new_workout(message.from_user.id, message, state)
+
+async def start_new_workout(user_id: int, message: types.Message, state: FSMContext):
+    """Создаёт новую тренировку"""
+    workout_id = f"{user_id}_{datetime.now().timestamp()}"
     start_time = datetime.now().isoformat()
     
+    # Сразу записываем в БД (с end_time = NULL)
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('''INSERT INTO workouts (user_id, workout_id, start_time, end_time, duration_minutes)
+                 VALUES (?, ?, ?, NULL, NULL)''',
+              (user_id, workout_id, start_time))
+    conn.commit()
+    conn.close()
+    
+    # Сохраняем в FSM
     await state.update_data(
         workout_id=workout_id,
         start_time=start_time,
@@ -332,11 +488,6 @@ async def cmd_start_workout(message: types.Message, state: FSMContext):
         set_count=0
     )
     await state.set_state(WorkoutStates.entering_sets)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Задать вопрос", callback_data="ask_question")],
-        [InlineKeyboardButton(text="🏁 Завершить тренировку", callback_data="end_workout")]
-    ])
     
     await message.answer(
         "🏋️ Тренировка начата!\n"
@@ -345,8 +496,140 @@ async def cmd_start_workout(message: types.Message, state: FSMContext):
         "• Жим лежа 80-10\n"
         "• Бег 5 минут\n"
         "• 80-10 (следующий подход)",
-        reply_markup=keyboard
+        reply_markup=get_workout_menu()
     )
+
+# ============ ОБРАБОТКА НЕЗАВЕРШЁННОЙ ТРЕНИРОВКИ ============
+
+@dp.callback_query(F.data.startswith("continue_workout:"))
+async def cb_continue_workout(callback: types.CallbackQuery, state: FSMContext):
+    """Продолжить незавершённую тренировку"""
+    workout_id = callback.data.split(":")[1]
+    
+    # Получаем данные тренировки
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('SELECT start_time FROM workouts WHERE workout_id = ?', (workout_id,))
+    result = c.fetchone()
+    
+    if not result:
+        await callback.message.answer("❌ Тренировка не найдена")
+        await callback.answer()
+        return
+    
+    # Получаем последнее упражнение
+    c.execute('''SELECT id, exercise_name FROM exercises 
+                 WHERE workout_id = ? 
+                 ORDER BY id DESC LIMIT 1''', (workout_id,))
+    last_exercise = c.fetchone()
+    
+    # Считаем подходы последнего упражнения
+    set_count = 0
+    current_exercise_id = None
+    current_exercise = None
+    
+    if last_exercise:
+        current_exercise_id = last_exercise[0]
+        current_exercise = last_exercise[1]
+        c.execute('SELECT COUNT(*) FROM sets WHERE exercise_id = ?', (current_exercise_id,))
+        set_count = c.fetchone()[0]
+    
+    conn.close()
+    
+    # Восстанавливаем FSM состояние
+    await state.update_data(
+        workout_id=workout_id,
+        start_time=result[0],
+        current_exercise=current_exercise,
+        current_exercise_id=current_exercise_id,
+        set_count=set_count
+    )
+    await state.set_state(WorkoutStates.entering_sets)
+    
+    exercises_count = get_workout_exercises_count(workout_id)
+    
+    await callback.message.answer(
+        f"🔄 Продолжаем тренировку!\n\n"
+        f"📝 Уже записано упражнений: {exercises_count}\n"
+        f"{'📍 Последнее: ' + current_exercise if current_exercise else ''}\n\n"
+        f"Вводи следующее упражнение или подход:",
+        reply_markup=get_workout_menu()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("finish_old_workout:"))
+async def cb_finish_old_workout(callback: types.CallbackQuery, state: FSMContext):
+    """Завершить незавершённую тренировку"""
+    workout_id = callback.data.split(":")[1]
+    
+    stats = finish_workout_in_db(workout_id, callback.from_user.id)
+    
+    if 'error' in stats:
+        await callback.message.answer(f"❌ {stats['error']}")
+        await callback.answer()
+        return
+    
+    tonnage_str = f"{stats['tonnage']:.0f}" if stats['tonnage'] else "0"
+    
+    await callback.message.answer(
+        f"🏁 Тренировка завершена!\n"
+        f"⏱ Длительность: {stats['duration']} минут\n"
+        f"📊 Выполнено: {stats['exercises_count']} упражнений, {stats['sets_count']} подходов\n"
+        f"💪 Общий тоннаж: {tonnage_str} кг\n\n"
+        f"Теперь можешь начать новую тренировку!",
+        reply_markup=get_main_menu()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("cancel_workout:"))
+async def cb_cancel_workout(callback: types.CallbackQuery, state: FSMContext):
+    """Отменить незавершённую тренировку"""
+    workout_id = callback.data.split(":")[1]
+    
+    cancel_workout_in_db(workout_id)
+    await state.clear()
+    
+    await callback.message.answer(
+        "❌ Тренировка отменена и удалена.\n\n"
+        "Можешь начать новую!",
+        reply_markup=get_main_menu()
+    )
+    await callback.answer()
+
+# ============ КОМАНДА /cancel ============
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    """Отменить текущую тренировку"""
+    current_state = await state.get_state()
+    data = await state.get_data()
+    
+    if current_state != WorkoutStates.entering_sets.state or 'workout_id' not in data:
+        # Проверяем БД на незавершённые
+        unfinished = get_unfinished_workout(message.from_user.id)
+        if unfinished:
+            cancel_workout_in_db(unfinished['workout_id'])
+            await message.answer(
+                "❌ Незавершённая тренировка отменена.\n\n"
+                "Можешь начать новую!",
+                reply_markup=get_main_menu()
+            )
+        else:
+            await message.answer("❌ Нет активной тренировки для отмены.")
+        return
+    
+    # Отменяем текущую
+    workout_id = data['workout_id']
+    cancel_workout_in_db(workout_id)
+    await state.clear()
+    
+    await message.answer(
+        "❌ Тренировка отменена и удалена.\n\n"
+        "Можешь начать новую!",
+        reply_markup=get_main_menu()
+    )
+
+# ============ ВВОД УПРАЖНЕНИЙ ============
 
 @dp.callback_query(F.data == "ask_question")
 async def ask_question_callback(callback: types.CallbackQuery):
@@ -419,11 +702,6 @@ async def process_workout_entry(message: types.Message, state: FSMContext):
     set_count += 1
     await state.update_data(set_count=set_count)
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Задать вопрос", callback_data="ask_question")],
-        [InlineKeyboardButton(text="🏁 Завершить тренировку", callback_data="end_workout")]
-    ])
-    
     # Формируем ответ
     if set_type == 'strength':
         response = f"✅ {current_exercise} — Подход {set_count}: {weight} кг x {reps} раз"
@@ -433,7 +711,9 @@ async def process_workout_entry(message: types.Message, state: FSMContext):
     else:
         response = f"✅ {current_exercise}: {duration} секунд"
     
-    await message.answer(response, reply_markup=keyboard)
+    await message.answer(response, reply_markup=get_workout_menu())
+
+# ============ ЗАВЕРШЕНИЕ ТРЕНИРОВКИ ============
 
 @dp.callback_query(F.data == "end_workout")
 async def end_workout(callback: types.CallbackQuery, state: FSMContext):
@@ -445,39 +725,29 @@ async def end_workout(callback: types.CallbackQuery, state: FSMContext):
         return
     
     workout_id = data['workout_id']
-    start_time = datetime.fromisoformat(data['start_time'])
-    end_time = datetime.now()
-    duration = int((end_time - start_time).total_seconds() / 60)
     
-    conn = sqlite3.connect('workouts.db')
-    c = conn.cursor()
-    c.execute('''INSERT INTO workouts (user_id, workout_id, start_time, end_time, duration_minutes)
-                 VALUES (?, ?, ?, ?, ?)''',
-              (callback.from_user.id, workout_id, data['start_time'],
-               end_time.isoformat(), duration))
+    # Используем функцию завершения
+    stats = finish_workout_in_db(workout_id, callback.from_user.id)
     
-    c.execute('''SELECT COUNT(DISTINCT e.id), COUNT(s.id), 
-                        SUM(CASE WHEN s.set_type = 'strength' THEN s.weight_kg * s.reps ELSE 0 END)
-                 FROM exercises e
-                 JOIN sets s ON e.id = s.exercise_id
-                 WHERE e.workout_id = ?''', (workout_id,))
-    exercises_count, sets_count, tonnage = c.fetchone()
-    
-    conn.commit()
-    conn.close()
+    if 'error' in stats:
+        await callback.message.answer(f"❌ {stats['error']}")
+        await callback.answer()
+        return
     
     await state.clear()
     
-    tonnage_str = f"{tonnage:.0f}" if tonnage else "0"
+    tonnage_str = f"{stats['tonnage']:.0f}" if stats['tonnage'] else "0"
     
     await callback.message.answer(
         f"🏁 Тренировка завершена!\n"
-        f"⏱ Длительность: {duration} минут\n"
-        f"📊 Выполнено: {exercises_count} упражнений, {sets_count} подходов\n"
+        f"⏱ Длительность: {stats['duration']} минут\n"
+        f"📊 Выполнено: {stats['exercises_count']} упражнений, {stats['sets_count']} подходов\n"
         f"💪 Общий тоннаж: {tonnage_str} кг",
         reply_markup=get_main_menu()
     )
     await callback.answer()
+
+# ============ СТАТИСТИКА ============
 
 @dp.callback_query(F.data == "stats")
 async def cb_stats(callback: types.CallbackQuery):
@@ -492,9 +762,9 @@ async def show_stats(user_id: int, message: types.Message):
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
     
-    # Общая статистика за всё время
+    # Общая статистика за всё время (только завершённые)
     c.execute('''SELECT COUNT(*), SUM(duration_minutes)
-                 FROM workouts WHERE user_id = ?''', (user_id,))
+                 FROM workouts WHERE user_id = ? AND end_time IS NOT NULL''', (user_id,))
     total_workouts, total_minutes = c.fetchone()
     
     # Рекорды по ВСЕМ упражнениям
@@ -522,6 +792,8 @@ async def show_stats(user_id: int, message: types.Message):
     
     await message.answer(stats)
 
+# ============ ИСТОРИЯ ============
+
 @dp.callback_query(F.data == "history")
 async def cb_history(callback: types.CallbackQuery):
     await show_history(callback.from_user.id, callback.message)
@@ -540,9 +812,11 @@ async def show_history(user_id: int, message: types.Message):
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
     
+    # Только завершённые тренировки
     c.execute('''SELECT w.workout_id, w.start_time, w.duration_minutes
                  FROM workouts w
                  WHERE w.user_id = ? AND date(w.start_time) >= ? AND date(w.start_time) <= ?
+                   AND w.end_time IS NOT NULL
                  ORDER BY w.start_time ASC''', 
               (user_id, start_of_week.isoformat(), end_of_week.isoformat()))
     
@@ -588,7 +862,6 @@ async def show_history(user_id: int, message: types.Message):
         for ex_name, data in ex_groups.items():
             if data['type'] == 'strength':
                 weights_str = ' → '.join(map(str, data['weights']))
-                reps_str = ' → '.join(map(str, data['reps']))
                 history += f"• {ex_name} — {len(data['weights'])} подх. ({weights_str} кг)\n"
             elif data['type'] == 'cardio':
                 mins = data['duration'] // 60 if data['duration'] else 0
@@ -599,8 +872,9 @@ async def show_history(user_id: int, message: types.Message):
         history += "\n"
     
     conn.close()
-    
     await message.answer(history)
+
+# ============ ПОМОЩЬ ============
 
 @dp.callback_query(F.data == "help")
 async def cb_help(callback: types.CallbackQuery):
@@ -623,18 +897,22 @@ async def show_help(message: types.Message):
         "   • Планка 60 секунд\n"
         "3. Нажми 'Завершить тренировку'\n\n"
         "📊 СТАТИСТИКА (/stats)\n"
-        "За всё время: количество тренировок, общее время, рекорды по весам\n\n"
+        "За всё время: количество тренировок, общее время, рекорды\n\n"
         "📅 ИСТОРИЯ (/history)\n"
-        "Все тренировки за текущую неделю с деталями\n\n"
+        "Все тренировки за текущую неделю\n\n"
         "🗑 УДАЛЕНИЕ (/delete)\n"
         "Удаляет последний подход\n\n"
+        "❌ ОТМЕНА (/cancel)\n"
+        "Отменяет текущую тренировку\n\n"
         "💬 ВОПРОСЫ\n"
-        "Нажми 'Задать вопрос' во время тренировки или просто напиши вопрос\n\n"
+        "Нажми 'Задать вопрос' или просто напиши\n\n"
         "📝 ОБРАТНАЯ СВЯЗЬ (/feedback)\n"
         "Напиши пожелания или сообщи о баге"
     )
     
     await message.answer(help_text)
+
+# ============ УДАЛЕНИЕ ============
 
 @dp.message(Command("delete"))
 async def cmd_delete(message: types.Message):
@@ -661,6 +939,8 @@ async def cmd_delete(message: types.Message):
     
     conn.close()
 
+# ============ FEEDBACK ============
+
 @dp.message(Command("feedback"))
 async def cmd_feedback(message: types.Message):
     text = message.text.replace('/feedback', '').strip()
@@ -682,9 +962,10 @@ async def cmd_feedback(message: types.Message):
         logger.error(f"Ошибка отправки feedback: {e}")
         await message.answer("❌ Ошибка отправки сообщения")
 
+# ============ АДМИНСКИЕ КОМАНДЫ ============
+
 @dp.message(Command("export"))
 async def cmd_export(message: types.Message):
-    """Экспорт БД (только для админа)"""
     if message.from_user.id != ADMIN_ID:
         await message.answer("❌ Команда недоступна")
         return
@@ -697,7 +978,6 @@ async def cmd_export(message: types.Message):
 
 @dp.message(Command("sync"))
 async def cmd_sync(message: types.Message):
-    """Ручная синхронизация с Google Sheets (только для админа)"""
     if message.from_user.id != ADMIN_ID:
         await message.answer("❌ Команда недоступна")
         return
@@ -706,16 +986,15 @@ async def cmd_sync(message: types.Message):
     await sync_to_google_sheets()
     await message.answer("✅ Синхронизация завершена!")
 
+# ============ ОБРАБОТКА ОСТАЛЬНЫХ СООБЩЕНИЙ ============
+
 @dp.message()
 async def handle_any_message(message: types.Message, state: FSMContext):
-    """Обработка любых сообщений вне тренировки"""
     current_state = await state.get_state()
     
-    # Если в процессе тренировки — пропускаем
     if current_state:
         return
     
-    # Проверяем, похоже ли на вопрос
     question_words = ['как', 'что', 'чем', 'почему', 'когда', 'стоит', 'можно', 'нужно', 'заменить', 'посоветуй', 'подскажи', '?']
     
     if any(word in message.text.lower() for word in question_words):
@@ -728,16 +1007,16 @@ async def handle_any_message(message: types.Message, state: FSMContext):
             reply_markup=get_main_menu()
         )
 
+# ============ MAIN ============
+
 async def main():
     logger.info("🚀 Бот запущен!")
     
-    # Настраиваем Google Sheets (создаём заголовки если нужно)
+    # Настраиваем Google Sheets
     try:
         client = get_google_sheets_client()
         if client and GOOGLE_SPREADSHEET_ID:
             sheet = client.open_by_key(GOOGLE_SPREADSHEET_ID)
-            
-            # Проверяем/создаём лист "Data"
             try:
                 worksheet = sheet.worksheet("Data")
                 logger.info("✅ Лист Data найден")
@@ -760,7 +1039,6 @@ async def main():
     scheduler.start()
     logger.info("✅ Планировщик синхронизации запущен (23:59 МСК)")
     
-    # Запускаем бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
