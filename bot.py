@@ -5,17 +5,23 @@ import re
 import sqlite3
 import base64
 import uuid
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from dotenv import load_dotenv
 import aiohttp
+import gspread
+from google.oauth2.service_account import Credentials
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+import pytz
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -28,35 +34,15 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID")
 GIGACHAT_CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET")
-
-# Отладка переменных
-print("=== DEBUG: Checking environment variables ===")
-print(f"TELEGRAM_TOKEN exists: {TELEGRAM_TOKEN is not None}")
-print(f"GIGACHAT_CLIENT_ID exists: {GIGACHAT_CLIENT_ID is not None}")
-print(f"GIGACHAT_CLIENT_SECRET exists: {GIGACHAT_CLIENT_SECRET is not None}")
-
-if GIGACHAT_CLIENT_ID:
-    print(f"GIGACHAT_CLIENT_ID starts with: {GIGACHAT_CLIENT_ID[:8]}...")
-else:
-    print("GIGACHAT_CLIENT_ID is EMPTY!")
-    
-if GIGACHAT_CLIENT_SECRET:
-    print(f"GIGACHAT_CLIENT_SECRET starts with: {GIGACHAT_CLIENT_SECRET[:8]}...")
-else:
-    print("GIGACHAT_CLIENT_SECRET is EMPTY!")
-
-# Показать все переменные с GIGA в названии
-print("=== All GIGA* variables ===")
-for key in os.environ.keys():
-    if "GIGA" in key.upper():
-        print(f"  {key} = {os.environ[key][:20]}...")
-
-print("=== END DEBUG ===")
+ADMIN_ID = 295220429  # Твой ID
+GOOGLE_SPREADSHEET_ID = os.getenv("GOOGLE_SPREADSHEET_ID")
+GOOGLE_SHEETS_CREDENTIALS = os.getenv("GOOGLE_SHEETS_CREDENTIALS")
 
 # Инициализация бота
 bot = Bot(token=TELEGRAM_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+scheduler = AsyncIOScheduler(timezone=pytz.timezone('Europe/Moscow'))
 
 # FSM состояния
 class WorkoutStates(StatesGroup):
@@ -92,66 +78,99 @@ def init_db():
 
 init_db()
 
-# Улучшенный парсер упражнений
+# Google Sheets
+def get_google_sheets_client():
+    try:
+        creds_dict = json.loads(GOOGLE_SHEETS_CREDENTIALS)
+        scopes = ['https://www.googleapis.com/auth/spreadsheets']
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        return client
+    except Exception as e:
+        logger.error(f"Google Sheets auth error: {e}")
+        return None
+
+async def sync_to_google_sheets():
+    """Синхронизация данных в Google Sheets (вызывается в 23:59)"""
+    try:
+        client = get_google_sheets_client()
+        if not client:
+            logger.error("Не удалось подключиться к Google Sheets")
+            return
+        
+        sheet = client.open_by_key(GOOGLE_SPREADSHEET_ID)
+        
+        # Получаем данные за сегодня
+        today = datetime.now().date()
+        conn = sqlite3.connect('workouts.db')
+        c = conn.cursor()
+        
+        c.execute('''SELECT w.user_id, w.start_time, w.end_time, w.duration_minutes,
+                            e.exercise_name, s.weight_kg, s.reps, s.duration_seconds, s.set_type
+                     FROM workouts w
+                     JOIN exercises e ON w.workout_id = e.workout_id
+                     JOIN sets s ON e.id = s.exercise_id
+                     WHERE date(w.start_time) = ?''', (today.isoformat(),))
+        
+        rows = c.fetchall()
+        conn.close()
+        
+        if not rows:
+            logger.info("Нет данных для синхронизации")
+            return
+        
+        # Worksheet "Data"
+        try:
+            worksheet = sheet.worksheet("Data")
+        except:
+            worksheet = sheet.add_worksheet(title="Data", rows=1000, cols=10)
+            worksheet.append_row(["User ID", "Дата", "Время начала", "Время конца", 
+                                  "Длительность (мин)", "Упражнение", "Вес (кг)", 
+                                  "Повторы", "Длительность (сек)", "Тип"])
+        
+        # Добавляем строки
+        for row in rows:
+            worksheet.append_row(list(row))
+        
+        logger.info(f"✅ Синхронизировано {len(rows)} записей в Google Sheets")
+        
+    except Exception as e:
+        logger.error(f"Ошибка синхронизации с Google Sheets: {e}")
+
+# Парсер упражнений
 def parse_workout_input(text: str) -> Tuple[Optional[str], Optional[float], Optional[int], Optional[int], str]:
-    """
-    Парсит ввод упражнений в разных форматах:
-    - "Жим лежа 80-10" -> (Жим лежа, 80, 10, None, 'strength')
-    - "80-10" -> (None, 80, 10, None, 'strength')
-    - "Бег 5 минут" -> (Бег, None, None, 300, 'cardio')
-    - "Планка 60 секунд" -> (Планка, None, None, 60, 'static')
-    
-    Возвращает: (название, вес, повторы, секунды, тип)
-    """
     text = text.strip()
     
-    # Паттерн 1: Упражнение + вес-повторы (Жим лежа 80-10)
     pattern1 = r'^(.+?)\s+(\d+(?:\.\d+)?)\s*[-xх×*]\s*(\d+)$'
     match = re.match(pattern1, text, re.IGNORECASE)
     if match:
-        exercise = match.group(1).strip()
-        weight = float(match.group(2))
-        reps = int(match.group(3))
-        return (exercise, weight, reps, None, 'strength')
+        return (match.group(1).strip(), float(match.group(2)), int(match.group(3)), None, 'strength')
     
-    # Паттерн 2: Только вес-повторы (80-10)
     pattern2 = r'^(\d+(?:\.\d+)?)\s*[-xх×*]\s*(\d+)$'
     match = re.match(pattern2, text)
     if match:
-        weight = float(match.group(1))
-        reps = int(match.group(2))
-        return (None, weight, reps, None, 'strength')
+        return (None, float(match.group(1)), int(match.group(2)), None, 'strength')
     
-    # Паттерн 3: Упражнение + минуты (Бег 5 минут)
     pattern3 = r'^(.+?)\s+(\d+)\s*(мин|минут|минуты|min|м).*$'
     match = re.match(pattern3, text, re.IGNORECASE)
     if match:
-        exercise = match.group(1).strip()
-        minutes = int(match.group(2))
-        return (exercise, None, None, minutes * 60, 'cardio')
+        return (match.group(1).strip(), None, None, int(match.group(2)) * 60, 'cardio')
     
-    # Паттерн 4: Упражнение + секунды (Планка 60 секунд)
     pattern4 = r'^(.+?)\s+(\d+)\s*(сек|секунд|секунды|sec|с).*$'
     match = re.match(pattern4, text, re.IGNORECASE)
     if match:
-        exercise = match.group(1).strip()
-        seconds = int(match.group(2))
-        return (exercise, None, None, seconds, 'static')
+        return (match.group(1).strip(), None, None, int(match.group(2)), 'static')
     
-    # Паттерн 5: Только название упражнения
     if not any(char.isdigit() for char in text):
         return (text, None, None, None, 'unknown')
     
     return (None, None, None, None, 'unknown')
 
-# GigaChat API (обновлённая авторизация)
+# GigaChat API
 async def get_gigachat_token():
-    """Получает access token для GigaChat через Client ID и Secret"""
     if not GIGACHAT_CLIENT_ID or not GIGACHAT_CLIENT_SECRET:
-        logger.error("GIGACHAT_CLIENT_ID or GIGACHAT_CLIENT_SECRET not set")
         return None
     
-    # Кодируем Client ID:Client Secret в Base64
     credentials = f"{GIGACHAT_CLIENT_ID}:{GIGACHAT_CLIENT_SECRET}"
     auth_key = base64.b64encode(credentials.encode()).decode()
     
@@ -169,19 +188,13 @@ async def get_gigachat_token():
             async with session.post(url, headers=headers, data=data, ssl=False) as response:
                 if response.status == 200:
                     result = await response.json()
-                    logger.info("✅ GigaChat token получен успешно")
                     return result.get('access_token')
-                else:
-                    error_text = await response.text()
-                    logger.error(f"❌ GigaChat auth error {response.status}: {error_text}")
     except Exception as e:
-        logger.error(f"❌ GigaChat token error: {e}")
+        logger.error(f"GigaChat token error: {e}")
     return None
-    
+
 async def ask_gigachat(user_id: int, question: str):
-    """Отправляет запрос в GigaChat с историей пользователя"""
     try:
-        # Получаем историю тренировок
         conn = sqlite3.connect('workouts.db')
         c = conn.cursor()
         
@@ -196,21 +209,18 @@ async def ask_gigachat(user_id: int, question: str):
         history = c.fetchall()
         conn.close()
         
-        # Формируем контекст
-        context = "История тренировок пользователя (последние записи):\n"
-        for row in history[:20]:  # Ограничиваем для промпта
+        context = "История тренировок:\n"
+        for row in history[:20]:
             date, exercise, weight, reps, duration, set_type = row
             if set_type == 'strength':
                 context += f"{date}: {exercise} - {weight}кг x {reps} раз\n"
             elif set_type in ['cardio', 'static']:
                 context += f"{date}: {exercise} - {duration} секунд\n"
         
-        # Получаем токен
         token = await get_gigachat_token()
         if not token:
-            return "⚠️ Ошибка подключения к GigaChat. Проверь настройки API ключа."
+            return "Ошибка подключения к GigaChat."
         
-        # Отправляем запрос
         url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
         headers = {
             'Content-Type': 'application/json',
@@ -221,7 +231,7 @@ async def ask_gigachat(user_id: int, question: str):
         payload = {
             "model": "GigaChat",
             "messages": [
-                {"role": "system", "content": f"Ты опытный персональный тренер. Анализируй данные и давай конкретные советы. {context}"},
+                {"role": "system", "content": f"Ты персональный тренер. {context}"},
                 {"role": "user", "content": question}
             ],
             "temperature": 0.7,
@@ -233,36 +243,38 @@ async def ask_gigachat(user_id: int, question: str):
                 if response.status == 200:
                     result = await response.json()
                     return result['choices'][0]['message']['content']
-                else:
-                    error_text = await response.text()
-                    logger.error(f"GigaChat API error {response.status}: {error_text}")
-                    return f"⚠️ Ошибка GigaChat API: {response.status}"
+                return "Ошибка GigaChat API"
                     
     except Exception as e:
         logger.error(f"GigaChat error: {e}")
-        return "⚠️ Произошла ошибка при обращении к ИИ"
+        return "Ошибка при обращении к ИИ"
 
 # Хэндлеры
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏋️ Начать тренировку", callback_data="start_workout")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
+         InlineKeyboardButton(text="📅 История", callback_data="history")],
+        [InlineKeyboardButton(text="❓ Помощь", callback_data="help")]
+    ])
+    
     await message.answer(
         "💪 Привет! Я твой персональный тренер.\n\n"
-        "🏋️ **Как записывать тренировки:**\n"
-        "• Жим лежа 80-10 (упражнение вес-повторы)\n"
-        "• Бег 5 минут\n"
-        "• Планка 60 секунд\n\n"
-        "📊 **Команды:**\n"
-        "/start_workout — начать тренировку\n"
-        "/ask — задать вопрос тренеру\n"
-        "/stats — статистика\n"
-        "/history — последние тренировки\n"
-        "/help — помощь",
-        parse_mode="Markdown"
+        "Выбери действие:",
+        reply_markup=keyboard
     )
 
+@dp.message(F.text.lower().in_(["привет", "хай", "hi", "hello", "здравствуй"]))
+async def greeting(message: types.Message):
+    await cmd_start(message)
+
+@dp.callback_query(F.data == "start_workout")
 @dp.message(Command("start_workout"))
-async def cmd_start_workout(message: types.Message, state: FSMContext):
-    workout_id = f"{message.from_user.id}_{datetime.now().timestamp()}"
+async def cmd_start_workout(event: types.Message | types.CallbackQuery, state: FSMContext):
+    message = event.message if isinstance(event, types.CallbackQuery) else event
+    
+    workout_id = f"{message.chat.id}_{datetime.now().timestamp()}"
     start_time = datetime.now().isoformat()
     
     await state.update_data(
@@ -280,32 +292,25 @@ async def cmd_start_workout(message: types.Message, state: FSMContext):
     ])
     
     await message.answer(
-        "🏋️ **Тренировка начата!**\n"
+        "🏋️ Тренировка начата!\n"
         f"⏱ Время: {datetime.now().strftime('%H:%M')}\n\n"
-        "Вводи упражнения в формате:\n"
+        "Вводи упражнения:\n"
         "• Жим лежа 80-10\n"
         "• Бег 5 минут\n"
-        "• 80-10 (следующий подход)\n\n"
-        "Или нажми 💬 чтобы задать вопрос",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
+        "• 80-10 (следующий подход)",
+        reply_markup=keyboard
     )
+    
+    if isinstance(event, types.CallbackQuery):
+        await event.answer()
 
 @dp.callback_query(F.data == "ask_question")
 async def ask_question_callback(callback: types.CallbackQuery):
-    await callback.message.answer(
-        "💡 Задай свой вопрос следующим сообщением.\n"
-        "Например: 'Чем заменить жим лежа?' или 'Стоит ли увеличить вес?'"
-    )
+    await callback.message.answer("💡 Задай свой вопрос следующим сообщением.")
     await callback.answer()
-
-@dp.message(Command("ask"))
-async def cmd_ask(message: types.Message):
-    await message.answer("💡 Задай свой вопрос:")
 
 @dp.message(WorkoutStates.entering_sets)
 async def process_workout_entry(message: types.Message, state: FSMContext):
-    # Проверяем не вопрос ли это (содержит вопросительные слова)
     question_words = ['как', 'что', 'чем', 'почему', 'когда', 'стоит', 'можно', 'нужно', 'заменить', 'посоветуй']
     if any(word in message.text.lower() for word in question_words) and len(message.text.split()) > 2:
         await message.answer("🤔 Думаю...")
@@ -316,31 +321,28 @@ async def process_workout_entry(message: types.Message, state: FSMContext):
             [InlineKeyboardButton(text="🏁 Завершить тренировку", callback_data="end_workout")]
         ])
         
-        await message.answer(answer, reply_markup=keyboard, parse_mode="Markdown")
+        await message.answer(answer, reply_markup=keyboard)
         return
     
     exercise_name, weight, reps, duration, set_type = parse_workout_input(message.text)
     
-    # Если не распознали формат
     if set_type == 'unknown':
         await message.answer(
             "❌ Не понял формат. Попробуй:\n"
             "• Жим лежа 80-10\n"
-            "• 80-10 (для того же упражнения)\n"
-            "• Бег 5 минут\n\n"
-            "Или нажми 💬 чтобы задать вопрос"
+            "• 80-10 (продолжить упражнение)\n"
+            "• Бег 5 минут"
         )
         return
     
     data = await state.get_data()
     workout_id = data['workout_id']
-    current_exercise = data.get('current_exercise')
     current_exercise_id = data.get('current_exercise_id')
+    set_count = data.get('set_count', 0)
     
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
     
-    # Если указано название упражнения — создаём новое
     if exercise_name:
         c.execute('''INSERT INTO exercises (workout_id, exercise_name, timestamp)
                      VALUES (?, ?, ?)''',
@@ -354,20 +356,20 @@ async def process_workout_entry(message: types.Message, state: FSMContext):
             current_exercise_id=current_exercise_id,
             set_count=0
         )
-    # Иначе продолжаем текущее
     elif current_exercise_id is None:
-        await message.answer("❌ Сначала укажи название упражнения, например: Жим лежа 80-10")
+        await message.answer("❌ Сначала укажи упражнение: Жим лежа 80-10")
         conn.close()
         return
+    else:
+        current_exercise = data.get('current_exercise')
     
-    # Сохраняем подход
     c.execute('''INSERT INTO sets (exercise_id, weight_kg, reps, duration_seconds, set_type, timestamp)
                  VALUES (?, ?, ?, ?, ?, ?)''',
               (current_exercise_id, weight, reps, duration, set_type, datetime.now().isoformat()))
     conn.commit()
     conn.close()
     
-    set_count = data.get('set_count', 0) + 1
+    set_count += 1
     await state.update_data(set_count=set_count)
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -375,26 +377,30 @@ async def process_workout_entry(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="🏁 Завершить тренировку", callback_data="end_workout")]
     ])
     
-    # Формируем ответ
     if set_type == 'strength':
-        response = f"✅ **{current_exercise}** — Подход {set_count}\n{weight} кг × {reps} раз"
+        response = f"✅ {current_exercise} — Подход {set_count}: {weight} кг x {reps} раз"
     elif set_type == 'cardio':
         mins = duration // 60
-        response = f"✅ **{current_exercise}**\n{mins} минут"
-    elif set_type == 'static':
-        response = f"✅ **{current_exercise}**\n{duration} секунд"
+        response = f"✅ {current_exercise}: {mins} минут"
+    else:
+        response = f"✅ {current_exercise}: {duration} секунд"
     
-    await message.answer(response, reply_markup=keyboard, parse_mode="Markdown")
+    await message.answer(response, reply_markup=keyboard)
 
 @dp.callback_query(F.data == "end_workout")
 async def end_workout(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    
+    if 'workout_id' not in data:
+        await callback.message.answer("❌ Тренировка не начата.")
+        await callback.answer()
+        return
+    
     workout_id = data['workout_id']
     start_time = datetime.fromisoformat(data['start_time'])
     end_time = datetime.now()
     duration = int((end_time - start_time).total_seconds() / 60)
     
-    # Сохраняем тренировку
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
     c.execute('''INSERT INTO workouts (user_id, workout_id, start_time, end_time, duration_minutes)
@@ -402,7 +408,6 @@ async def end_workout(callback: types.CallbackQuery, state: FSMContext):
               (callback.from_user.id, workout_id, data['start_time'],
                end_time.isoformat(), duration))
     
-    # Подсчёт статистики
     c.execute('''SELECT COUNT(DISTINCT e.id), COUNT(s.id), 
                         SUM(CASE WHEN s.set_type = 'strength' THEN s.weight_kg * s.reps ELSE 0 END)
                  FROM exercises e
@@ -415,22 +420,27 @@ async def end_workout(callback: types.CallbackQuery, state: FSMContext):
     
     await state.clear()
     
+    tonnage_str = f"{tonnage:.0f}" if tonnage else "0"
+    
     await callback.message.answer(
-        f"🏁 **Тренировка завершена!**\n"
+        f"🏁 Тренировка завершена!\n"
         f"⏱ Длительность: {duration} минут\n"
         f"📊 Выполнено: {exercises_count} упражнений, {sets_count} подходов\n"
-        f"💪 Общий тоннаж: {tonnage:.0f} кг",
-        parse_mode="Markdown"
+        f"💪 Общий тоннаж: {tonnage_str} кг"
     )
     await callback.answer()
 
+@dp.callback_query(F.data == "stats")
 @dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
+async def cmd_stats(event: types.Message | types.CallbackQuery):
+    message = event.message if isinstance(event, types.CallbackQuery) else event
+    user_id = message.chat.id
+    
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
     
     c.execute('''SELECT COUNT(*), SUM(duration_minutes)
-                 FROM workouts WHERE user_id = ?''', (message.from_user.id,))
+                 FROM workouts WHERE user_id = ?''', (user_id,))
     total_workouts, total_minutes = c.fetchone()
     
     c.execute('''SELECT e.exercise_name, MAX(s.weight_kg)
@@ -439,82 +449,175 @@ async def cmd_stats(message: types.Message):
                  JOIN sets s ON e.id = s.exercise_id
                  WHERE w.user_id = ? AND s.set_type = 'strength'
                  GROUP BY e.exercise_name
-                 ORDER BY MAX(s.weight_kg) DESC
-                 LIMIT 5''', (message.from_user.id,))
+                 ORDER BY MAX(s.weight_kg) DESC''', (user_id,))
     records = c.fetchall()
     
     conn.close()
     
-    stats = f"📊 **Твоя статистика:**\n\n"
-    stats += f"Всего тренировок: **{total_workouts or 0}**\n"
-    stats += f"Всего времени: **{total_minutes or 0}** минут\n\n"
+    stats = f"📊 Статистика за всё время:\n\n"
+    stats += f"Всего тренировок: {total_workouts or 0}\n"
+    stats += f"Общее время: {total_minutes or 0} минут\n\n"
     
     if records:
-        stats += "🏆 **Рекорды по весам:**\n"
+        stats += "🏆 Рекорды по весам:\n"
         for name, weight in records:
-            stats += f"• {name}: **{weight} кг**\n"
+            stats += f"• {name}: {weight} кг\n"
     
-    await message.answer(stats, parse_mode="Markdown")
+    await message.answer(stats)
+    
+    if isinstance(event, types.CallbackQuery):
+        await event.answer()
 
+@dp.callback_query(F.data == "history")
 @dp.message(Command("history"))
-async def cmd_history(message: types.Message):
+async def cmd_history(event: types.Message | types.CallbackQuery):
+    message = event.message if isinstance(event, types.CallbackQuery) else event
+    user_id = message.chat.id
+    
+    # Определяем начало недели (понедельник)
+    today = datetime.now().date()
+    start_of_week = today - timedelta(days=today.weekday())
+    end_of_week = start_of_week + timedelta(days=6)
+    
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
     
-    c.execute('''SELECT start_time, duration_minutes
-                 FROM workouts
-                 WHERE user_id = ?
-                 ORDER BY start_time DESC
-                 LIMIT 10''', (message.from_user.id,))
+    c.execute('''SELECT w.workout_id, w.start_time, w.duration_minutes
+                 FROM workouts w
+                 WHERE w.user_id = ? AND date(w.start_time) >= ? AND date(w.start_time) <= ?
+                 ORDER BY w.start_time ASC''', 
+              (user_id, start_of_week.isoformat(), end_of_week.isoformat()))
+    
     workouts = c.fetchall()
-    conn.close()
     
     if not workouts:
-        await message.answer("У тебя пока нет тренировок. Начни с /start_workout!")
+        await message.answer("У тебя пока нет тренировок на этой неделе.")
+        conn.close()
+        if isinstance(event, types.CallbackQuery):
+            await event.answer()
         return
     
-    history = "📅 **Последние тренировки:**\n\n"
-    for start, duration in workouts:
-        dt = datetime.fromisoformat(start)
-        history += f"• {dt.strftime('%d.%m.%Y %H:%M')} — {duration} мин\n"
+    history = f"📅 Тренировки за неделю ({start_of_week.strftime('%d.%m')} - {end_of_week.strftime('%d.%m.%Y')}):\n\n"
     
-    await message.answer(history, parse_mode="Markdown")
+    for idx, (workout_id, start_time, duration) in enumerate(workouts, 1):
+        dt = datetime.fromisoformat(start_time)
+        weekday = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье'][dt.weekday()]
+        
+        history += f"Тренировка {idx} — {weekday} {dt.strftime('%d.%m')}\n"
+        
+        # Получаем упражнения
+        c.execute('''SELECT e.exercise_name, s.weight_kg, s.reps, s.duration_seconds, s.set_type
+                     FROM exercises e
+                     JOIN sets s ON e.id = s.exercise_id
+                     WHERE e.workout_id = ?
+                     ORDER BY e.id, s.id''', (workout_id,))
+        
+        exercises = c.fetchall()
+        
+        # Группируем по упражнениям
+        current_ex = None
+        weights = []
+        reps_list = []
+        
+        for ex_name, weight, reps, duration, set_type in exercises:
+            if ex_name != current_ex:
+                if current_ex:
+                    if set_type == 'strength':
+                        history += f"   Веса: {' → '.join(map(str, weights))} кг\n"
+                        history += f"   Повторы: {' → '.join(map(str, reps_list))}\n"
+                weights = []
+                reps_list = []
+                current_ex = ex_name
+                
+                if set_type == 'strength':
+                    history += f"💪 {ex_name}\n"
+                elif set_type == 'cardio':
+                    history += f"🏃 {ex_name} — {duration//60} минут\n"
+                else:
+                    history += f"⏱ {ex_name} — {duration} секунд\n"
+            
+            if set_type == 'strength':
+                weights.append(int(weight))
+                reps_list.append(reps)
+        
+        # Последнее упражнение
+        if weights:
+            history += f"   Веса: {' → '.join(map(str, weights))} кг\n"
+            history += f"   Повторы: {' → '.join(map(str, reps_list))}\n"
+        
+        history += "\n"
+    
+    conn.close()
+    
+    await message.answer(history)
+    
+    if isinstance(event, types.CallbackQuery):
+        await event.answer()
 
+@dp.callback_query(F.data == "help")
 @dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-    await message.answer(
-        "ℹ️ **Как пользоваться:**\n\n"
-        "**1. Начни тренировку:**\n"
-        "/start_workout\n\n"
-        "**2. Вводи упражнения:**\n"
-        "• Жим лежа 80-10\n"
-        "• 80-8 (следующий подход)\n"
-        "• Бег 5 минут\n\n"
-        "**3. Задавай вопросы:**\n"
-        "• Кнопка 💬 во время тренировки\n"
-        "• Или команда /ask в любое время\n\n"
-        "**4. Завершай:**\n"
-        "Кнопка 🏁 Завершить",
-        parse_mode="Markdown"
-    )
-
-@dp.message()
-async def handle_question(message: types.Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state:
-        return  # В режиме тренировки обрабатываем отдельно
+async def cmd_help(event: types.Message | types.CallbackQuery):
+    message = event.message if isinstance(event, types.CallbackQuery) else event
     
-    await message.answer("🤔 Думаю...")
-    answer = await ask_gigachat(message.from_user.id, message.text)
-    await message.answer(answer, parse_mode="Markdown")
+    help_text = (
+        "ℹ️ Как пользоваться ботом:\n\n"
+        "🏋️ Начать тренировку:\n"
+        "/start_workout или кнопка\n\n"
+        "📝 Вводить упражнения:\n"
+        "• Жим лежа 80-10 (упражнение вес-повторы)\n"
+        "• 80-8 (следующий подход того же упражнения)\n"
+        "• Бег 5 минут (кардио)\n"
+        "• Планка 60 секунд (статика)\n\n"
+        "📊 /stats — статистика за всё время + рекорды\n"
+        "📅 /history — тренировки за текущую неделю\n"
+        "🗑 /delete — удалить последнюю запись\n"
+        "📢 /feedback — написать разработчику\n\n"
+        "💬 Вопросы к ИИ:\n"
+        "Просто напиши вопрос в чат или нажми кнопку 💬 во время тренировки"
+    )
+    
+    await message.answer(help_text)
+    
+    if isinstance(event, types.CallbackQuery):
+        await event.answer()
 
-# Запуск бота
-async def main():
-    logger.info("Бот запущен!")
-    await dp.start_polling(bot)
+@dp.message(Command("delete"))
+async def cmd_delete(message: types.Message):
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    
+    # Находим последний подход пользователя
+    c.execute('''SELECT s.id FROM sets s
+                 JOIN exercises e ON s.exercise_id = e.id
+                 JOIN workouts w ON e.workout_id = w.workout_id
+                 WHERE w.user_id = ?
+                 ORDER BY s.timestamp DESC LIMIT 1''', (message.from_user.id,))
+    
+    result = c.fetchone()
+    
+    if result:
+        c.execute('DELETE FROM sets WHERE id = ?', (result[0],))
+        conn.commit()
+        await message.answer("✅ Последняя запись удалена")
+    else:
+        await message.answer("❌ Нет записей для удаления")
+    
+    conn.close()
 
-if __name__ == "__main__":
-    asyncio.run(main())
-
-
-# Railway redeploy trigger
+@dp.message(Command("feedback"))
+async def cmd_feedback(message: types.Message):
+    text = message.text.replace('/feedback', '').strip()
+    
+    if not text:
+        await message.answer("Напиши: /feedback текст сообщения")
+        return
+    
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"📢 Feedback от пользователя {message.from_user.id}:\n"
+            f"Имя: {message.from_user.full_name}\n"
+            f"Username: @{message.from_user.username}\n\n"
+            f"{text}"
+        )
+        await message.answer("✅ Сообщение отправлено 
