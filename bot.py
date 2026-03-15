@@ -131,7 +131,7 @@ async def get_gigachat_token():
         'Content-Type': 'application/x-www-form-urlencoded',
         'Accept': 'application/json',
         'RqUID': str(uuid.uuid4()),
-        'Authorization': f'Bearer {GIGACHAT_AUTH_KEY}'
+        'Authorization': f'Basic {GIGACHAT_AUTH_KEY}'  # ← ИЗМЕНЕНО: Basic вместо Bearer
     }
     data = {'scope': 'GIGACHAT_API_PERS'}
     
@@ -140,6 +140,7 @@ async def get_gigachat_token():
             async with session.post(url, headers=headers, data=data, ssl=False) as response:
                 if response.status == 200:
                     result = await response.json()
+                    logger.info("GigaChat token получен успешно")
                     return result.get('access_token')
                 else:
                     error_text = await response.text()
