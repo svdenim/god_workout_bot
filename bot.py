@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Токены
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY")
+GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_KEY")
 
 # Отладка
 logger.info(f"TELEGRAM_TOKEN exists: {TELEGRAM_TOKEN is not None}")
