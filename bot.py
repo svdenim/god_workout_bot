@@ -62,6 +62,9 @@ class ProfileStates(StatesGroup):
     entering_birthdate = State()
     entering_weight = State()
     updating_weight = State()
+    
+class CancelStates(StatesGroup):
+    choosing_workout = State()
 
 # Группы мышц
 MUSCLE_GROUPS = {
@@ -338,8 +341,31 @@ def finish_workout_in_db(workout_id: str, user_id: int) -> dict:
         'tonnage': tonnage or 0
     }
 
-def cancel_workout_in_db(workout_id: str) -> bool:
-    """Отменяет тренировку"""
+def get_user_recent_workouts(user_id: int, limit: int = 5) -> list:
+    """Получает последние N завершённых тренировок пользователя"""
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('''SELECT id, workout_id, workout_number, start_time, duration_minutes, synced_to_sheets
+                 FROM workouts 
+                 WHERE user_id = ? AND end_time IS NOT NULL
+                 ORDER BY start_time DESC LIMIT ?''', (user_id, limit))
+    results = c.fetchall()
+    conn.close()
+    
+    workouts = []
+    for row in results:
+        workouts.append({
+            'id': row[0],
+            'workout_id': row[1],
+            'workout_number': row[2],
+            'start_time': row[3],
+            'duration_minutes': row[4],
+            'synced': row[5]
+        })
+    return workouts
+
+def delete_workout_from_db(workout_id: str) -> bool:
+    """Удаляет тренировку из БД"""
     conn = sqlite3.connect('workouts.db')
     c = conn.cursor()
     c.execute('DELETE FROM sets WHERE exercise_id IN (SELECT id FROM exercises WHERE workout_id = ?)', (workout_id,))
@@ -704,7 +730,29 @@ def get_reminder_keyboard():
         [InlineKeyboardButton(text="🏁 Завершить", callback_data="end_workout")],
         [InlineKeyboardButton(text="💪 Ещё тренируюсь", callback_data="continue_training")]
     ])
+def get_cancel_menu(has_active: bool):
+    buttons = []
+    if has_active:
+        buttons.append([InlineKeyboardButton(text="❌ Отменить текущую", callback_data="cancel_current")])
+    buttons.append([InlineKeyboardButton(text="🗑 Удалить из списка", callback_data="cancel_choose")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+def get_workouts_list_keyboard(workouts: list):
+    buttons = []
+    for w in workouts:
+        dt = datetime.fromisoformat(w['start_time'])
+        weekday = WEEKDAYS_RU[dt.weekday()][:3]
+        text = f"#{w['workout_number']} — {weekday} {dt.strftime('%d.%m')} ({w['duration_minutes']} мин)"
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f"delete_workout:{w['workout_id']}")])
+    buttons.append([InlineKeyboardButton(text="◀️ Отмена", callback_data="back_to_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_confirm_delete_keyboard(workout_id: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_delete:{workout_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_choose")]
+    ])
 # ============ НАПОМИНАНИЕ О ЗАВЕРШЕНИИ ТРЕНИРОВКИ ============
 
 async def send_workout_reminder(user_id: int, workout_id: str):
@@ -1250,26 +1298,89 @@ async def cb_continue_training(callback: types.CallbackQuery):
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
-    """Отменить текущую тренировку"""
+    user_id = message.from_user.id
     current_state = await state.get_state()
-    data = await state.get_data()
+    has_active = current_state == WorkoutStates.entering_sets.state
     
-    if current_state == WorkoutStates.entering_sets.state and 'workout_id' in data:
-        workout_id = data['workout_id']
-        cancel_workout_reminders(workout_id)
-        cancel_workout_in_db(workout_id)
-        await state.clear()
-        await message.answer("❌ Тренировка отменена.", reply_markup=get_main_menu())
+    await message.answer("🗑 Что хочешь сделать?", reply_markup=get_cancel_menu(has_active))
+
+@dp.callback_query(F.data == "cancel_current")
+async def cb_cancel_current(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if 'workout_id' in data:
+        cancel_workout_reminders(data['workout_id'])
+        cancel_workout_in_db(data['workout_id'])
+    await state.clear()
+    await callback.message.answer("❌ Текущая тренировка отменена.", reply_markup=get_main_menu())
+    await callback.answer()
+
+@dp.callback_query(F.data == "cancel_choose")
+async def cb_cancel_choose(callback: types.CallbackQuery):
+    workouts = get_user_recent_workouts(callback.from_user.id, 5)
+    if not workouts:
+        await callback.message.answer("❌ Нет тренировок для удаления.", reply_markup=get_main_menu())
+        await callback.answer()
         return
     
-    # Проверяем БД
-    unfinished = get_unfinished_workout(message.from_user.id)
-    if unfinished:
-        cancel_workout_reminders(unfinished['workout_id'])
-        cancel_workout_in_db(unfinished['workout_id'])
-        await message.answer("❌ Незавершённая тренировка отменена.", reply_markup=get_main_menu())
-    else:
-        await message.answer("❌ Нет активной тренировки для отмены.")
+    await callback.message.answer("Выбери тренировку для удаления:", 
+                                  reply_markup=get_workouts_list_keyboard(workouts))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("delete_workout:"))
+async def cb_delete_workout(callback: types.CallbackQuery):
+    workout_id = callback.data.split(":")[1]
+    
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('''SELECT workout_number, start_time, duration_minutes, synced_to_sheets 
+                 FROM workouts WHERE workout_id = ?''', (workout_id,))
+    result = c.fetchone()
+    
+    if not result:
+        await callback.message.answer("❌ Тренировка не найдена.")
+        await callback.answer()
+        conn.close()
+        return
+    
+    workout_num, start_time, duration, synced = result
+    
+    c.execute('SELECT COUNT(*) FROM exercises WHERE workout_id = ?', (workout_id,))
+    ex_count = c.fetchone()[0]
+    c.execute('''SELECT COUNT(*) FROM sets WHERE exercise_id IN 
+                 (SELECT id FROM exercises WHERE workout_id = ?)''', (workout_id,))
+    sets_count = c.fetchone()[0]
+    conn.close()
+    
+    dt = datetime.fromisoformat(start_time)
+    warning = "\n\n⚠️ Уже в Google Sheets — удали вручную!" if synced else ""
+    
+    await callback.message.answer(
+        f"Удалить тренировку #{workout_num}?\n\n"
+        f"📅 {dt.strftime('%d.%m.%Y %H:%M')}\n"
+        f"⏱ {duration} мин\n"
+        f"📊 {ex_count} упр., {sets_count} подх.{warning}",
+        reply_markup=get_confirm_delete_keyboard(workout_id))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("confirm_delete:"))
+async def cb_confirm_delete(callback: types.CallbackQuery):
+    workout_id = callback.data.split(":")[1]
+    
+    conn = sqlite3.connect('workouts.db')
+    c = conn.cursor()
+    c.execute('SELECT synced_to_sheets FROM workouts WHERE workout_id = ?', (workout_id,))
+    result = c.fetchone()
+    synced = result[0] if result else 0
+    conn.close()
+    
+    delete_workout_from_db(workout_id)
+    
+    msg = "✅ Тренировка удалена из БД."
+    if synced:
+        msg += "\n\n⚠️ Из Google Sheets удали вручную!"
+    
+    await callback.message.answer(msg, reply_markup=get_main_menu())
+    await callback.answer()
 
 # ============ ВВОД УПРАЖНЕНИЙ ============
 
